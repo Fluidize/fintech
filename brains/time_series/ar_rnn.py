@@ -130,25 +130,42 @@ class TimeSeriesPredictor:
         growth_rate = 32  # Number of features added by each dense layer
 
         inputs = layers.Input(shape=(X.shape[1], X.shape[2]), name='input_layer')
-        
-        # Embedding layer
+    
         x = layers.Dense(embedding_dim, name='embedding_projection')(inputs)
         
         transformer_outputs = [x]
         for i in range(2):
             concat_inputs = layers.Concatenate(name=f'transformer_{i}_concat')(transformer_outputs)
             
-            attention_output = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=embedding_dim//num_heads,
-                name=f'transformer_{i}_attention'
-            )(concat_inputs, concat_inputs)
+            # Self-attention: sequence attends to itself
+            self_attention = layers.MultiHeadAttention(
+                num_heads=num_heads, 
+                key_dim=embedding_dim//num_heads,
+                name=f'transformer_{i}_self_attention'
+            )(
+                query=concat_inputs,    # Current sequence is query
+                key=concat_inputs,      # Attends to itself (key)
+                value=concat_inputs     # Values from same sequence
+            )
+            
+            # Cross-attention with input if not first block
+            if i > 0:
+                cross_attention = layers.MultiHeadAttention(
+                    num_heads=num_heads,
+                    key_dim=embedding_dim//num_heads,
+                    name=f'transformer_{i}_cross_attention'
+                )(
+                    query=self_attention,     # Current block's output
+                    key=transformer_outputs[0],   # Original input as key
+                    value=transformer_outputs[0]  # Original input as value
+                )
+                self_attention = layers.Add(name=f'transformer_{i}_cross_merge')([self_attention, cross_attention]) #add to merge with original input
             
             # Position-wise feed-forward network
-            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(attention_output)
+            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(self_attention)
             ffn = layers.Dense(embedding_dim, name=f'transformer_{i}_ffn_2')(ffn)
             
             transformer_outputs.append(ffn)
-
         x = layers.Concatenate(name='transformer_final_concat')(transformer_outputs)
         
         # GRU layers with dense connections
@@ -185,7 +202,6 @@ class TimeSeriesPredictor:
         # Final concatenation of all dense outputs
         x = layers.Concatenate(name='final_concat')(dense_outputs)
         
-        # Transition layer to reduce dimensionality before output
         x = layers.Dense(self.dense_width, activation='relu', name='transition_layer')(x)
         
         outputs = layers.Dense(5, name='output_layer')(x)
@@ -256,21 +272,49 @@ class TimeSeriesPredictor:
         
         # Get layer information from model
         layer_info = []
-        for layer in model_data.model.layers:
-            layer_name = layer.__class__.__name__
-            if layer_name == 'Dense':
-                layer_info.append(f"{layer_name}({layer.units})")
-            else:
-                layer_info.append(layer_name)
+        layers_per_line = 4  # More layers per line since names are shorter
         
-        # Create architecture text
+        # Create short names mapping
+        layer_names = {
+            'InputLayer': 'In',
+            'Dense': 'D',
+            'GRU': 'GRU',
+            'Bidirectional': 'Bi',
+            'MultiHeadAttention': 'MHA',
+            'Add': '+',
+            'Concatenate': 'Cat',
+            'LeakyReLU': 'LReLU',
+            'BatchNormalization': 'BN'
+        }
+        
+        # Group layers by type
+        for layer, index in zip(model_data.model.layers, range(len(model_data.model.layers))):
+            layer_name = layer.__class__.__name__
+            
+            # Add line break every few layers
+            if index % layers_per_line == 0 and index > 0:
+                layer_info.append("<br>")
+            
+            # Format layer info based on type
+            if layer_name == 'Dense':
+                layer_info.append(f"D{layer.units}")  # D128 instead of Dense(128)
+            elif layer_name == 'GRU':
+                layer_info.append(f"BiGRU{layer.units}")  # BiGRU256 instead of BiGRU(256)
+            elif layer_name == 'MultiHeadAttention':
+                layer_info.append(f"MHA{layer.num_heads}")  # MHA4 instead of MHA(4)
+            else:
+                short_name = layer_names.get(layer_name, layer_name)
+                layer_info.append(short_name)
+        
+        # Create architecture text with sections
         architecture_text = (
-            "Model Architecture:<br>" +
-            " → ".join(layer_info) + "<br><br>" +
-            f"Parameters:<br>"
-            f"RNN Width: {self.rnn_width}<br>"
-            f"Dense Width: {self.dense_width}<br>"
-            f"Total Params: {model_data.model.count_params():,}"
+            "<b>Architecture:</b><br>" +
+            " → ".join(layer_info) +
+            "<br><br><b>Params:</b><br>" +
+            f"RNN: {self.rnn_width} | Dense: {self.dense_width}<br>" +
+            f"Total: {model_data.model.count_params():,}<br><br>" +
+            f"<b>Training:</b><br>" +
+            f"Batch: 32 | LR: 1e-5"
         )
         
         fig = make_subplots(rows=3, cols=1, 
@@ -303,7 +347,7 @@ class TimeSeriesPredictor:
 
         # Add architecture text box in the loss plot
         fig.add_annotation(
-            x=len(model_data.history['loss'])/2, #align better with loss plot
+            x=1, #align better with loss plot
             y=1,
             xref='paper',
             yref='paper',
