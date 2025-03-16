@@ -120,29 +120,28 @@ class TimeSeriesPredictor:
         X = X.values.reshape((X.shape[0], 1, X.shape[1]))
         print(f"Training shapes - X: {X.shape}, y: {y.shape}")
         
-        l2_reg = 1e-3  # L2 regularization factor
-        self.dense_count = 5
+        l2_reg = 0
+        self.rnn_count = 3
+        self.dense_count = 50
 
         inputs = layers.Input(shape=(X.shape[1], X.shape[2]))
+        x = inputs
+
+        for i in range(self.rnn_count):
+            return_sequences = i < self.rnn_count - 1
+            x = layers.Bidirectional(layers.GRU(
+                    units=self.rnn_width,
+                    return_sequences=return_sequences,
+                    kernel_regularizer=regularizers.l2(l2_reg),
+                    name=f'gru_layer_{i}'
+            ))(x)
+            x = layers.BatchNormalization(name=f'batch_norm_{i}')(x)
         
-        x = layers.MaxPooling1D(pool_size=2, padding='same')(inputs)
+        for i in range(self.dense_count):
+            x = layers.Dense(self.dense_width, name=f'dense_{i}')(x)
+            x = layers.LeakyReLU(name=f'leaky_relu_{i}')(x)
         
-        x = layers.Bidirectional(layers.GRU(units=self.rnn_width, return_sequences=True, 
-                       kernel_regularizer=regularizers.l2(l2_reg)))(x)
-        
-        x = layers.Bidirectional(layers.GRU(units=self.rnn_width, return_sequences=True,
-                       kernel_regularizer=regularizers.l2(l2_reg)))(x)
-        
-        # Third GRU layer (final RNN layer)
-        x = layers.Bidirectional(layers.GRU(units=self.rnn_width,
-                       kernel_regularizer=regularizers.l2(l2_reg)))(x)
-        
-        # Dense layers
-        for _ in range(self.dense_count):
-            x = layers.Dense(self.dense_width)(x)
-            x = layers.LeakyReLU()(x)
-        
-        outputs = layers.Dense(5)(x) #5feature output
+        outputs = layers.Dense(5, name='output')(x) #5feature output
         
         lossfn = losses.Huber(delta=5.0)
         model = models.Model(inputs=inputs, outputs=outputs)
@@ -257,7 +256,7 @@ class TimeSeriesPredictor:
         # Add architecture text box in the loss plot
         fig.add_annotation(
             x=len(model_data.history['loss'])/2, #align better with loss plot
-            y=0.98,
+            y=1,
             xref='paper',
             yref='paper',
             text=architecture_text,
@@ -355,7 +354,7 @@ class ModelTesting(TimeSeriesPredictor):
         data = self._extended_predict(self.model, data, model_interval, extension)
         return data
 
-test_client = TimeSeriesPredictor(epochs=5, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=7, interval='5m', age_days=1)
+test_client = TimeSeriesPredictor(epochs=5, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
 data, yhat, model_data = test_client.run(save=False)
 test_client.create_plot(data, yhat, model_data, show_graph=True)
 
