@@ -120,35 +120,79 @@ class TimeSeriesPredictor:
         X = X.values.reshape((X.shape[0], 1, X.shape[1]))
         print(f"Training shapes - X: {X.shape}, y: {y.shape}")
         
-        l2_reg = 0
+        l1_reg = 1e-4
+        l2_reg = 1e-4
         self.rnn_count = 3
-        self.dense_count = 50
+        self.dense_count = 5
+        embedding_dim = 32  # Size of embedding space
+        num_heads = X.shape[2] #feature count
+        ff_dim = 64       # Feed-forward network dimension
+        growth_rate = 32  # Number of features added by each dense layer
 
-        inputs = layers.Input(shape=(X.shape[1], X.shape[2]))
-        x = inputs
+        inputs = layers.Input(shape=(X.shape[1], X.shape[2]), name='input_layer')
+        
+        # Embedding layer
+        x = layers.Dense(embedding_dim, name='embedding_projection')(inputs)
+        
+        transformer_outputs = [x]
+        for i in range(2):
+            concat_inputs = layers.Concatenate(name=f'transformer_{i}_concat')(transformer_outputs)
+            
+            attention_output = layers.MultiHeadAttention(
+                num_heads=num_heads, key_dim=embedding_dim//num_heads,
+                name=f'transformer_{i}_attention'
+            )(concat_inputs, concat_inputs)
+            
+            # Position-wise feed-forward network
+            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(attention_output)
+            ffn = layers.Dense(embedding_dim, name=f'transformer_{i}_ffn_2')(ffn)
+            
+            transformer_outputs.append(ffn)
 
+        x = layers.Concatenate(name='transformer_final_concat')(transformer_outputs)
+        
+        # GRU layers with dense connections
+        gru_outputs = [x]
         for i in range(self.rnn_count):
             return_sequences = i < self.rnn_count - 1
-            x = layers.Bidirectional(layers.GRU(
+            # Concatenate all previous outputs
+            concat_inputs = layers.Concatenate(name=f'gru_{i}_concat')(gru_outputs)
+            
+            gru_out = layers.Bidirectional(layers.GRU(
                     units=self.rnn_width,
                     return_sequences=return_sequences,
-                    kernel_regularizer=regularizers.l2(l2_reg),
+                    kernel_regularizer=regularizers.l1_l2(l1=l1_reg, l2=l2_reg),
                     name=f'gru_layer_{i}'
-            ))(x)
-            x = layers.BatchNormalization(name=f'batch_norm_{i}')(x)
+            ), name=f'bidirectional_gru_{i}')(concat_inputs)
+            
+            gru_outputs.append(gru_out)
         
+        # Final GRU output
+        x = gru_outputs[-1]
+        
+        # Dense layers with DenseNet-style connections
+        dense_outputs = [x]
         for i in range(self.dense_count):
-            x = layers.Dense(self.dense_width, name=f'dense_{i}')(x)
-            x = layers.LeakyReLU(name=f'leaky_relu_{i}')(x)
+            # Concatenate all previous outputs
+            concat_inputs = layers.Concatenate(name=f'dense_{i}_concat')(dense_outputs)
+            
+            # Dense block
+            x = layers.Dense(growth_rate, name=f'dense_layer_{i}')(concat_inputs)
+            x = layers.LeakyReLU(name=f'leaky_relu_layer_{i}')(x)
+            
+            dense_outputs.append(x)
         
-        outputs = layers.Dense(5, name='output')(x) #5feature output
+        # Final concatenation of all dense outputs
+        x = layers.Concatenate(name='final_concat')(dense_outputs)
+        
+        # Transition layer to reduce dimensionality before output
+        x = layers.Dense(self.dense_width, activation='relu', name='transition_layer')(x)
+        
+        outputs = layers.Dense(5, name='output_layer')(x)
+        
         
         lossfn = losses.Huber(delta=5.0)
-        model = models.Model(inputs=inputs, outputs=outputs)
-        model.compile(optimizer=optimizers.Adam(learning_rate=2e-3),
-                     loss=lossfn,
-                     metrics=['mae'])
-        
+        optimizer = optimizers.Adam(learning_rate=1e-5)
         callbacks_list = [
             callbacks.EarlyStopping(monitor='val_loss', patience=15,
                                   restore_best_weights=True),
@@ -160,6 +204,10 @@ class TimeSeriesPredictor:
             #                         monitor='val_loss', 
             #                         save_best_only=True)
         ]
+        model = models.Model(inputs=inputs, outputs=outputs)
+        model.compile(optimizer=optimizer,
+                     loss=lossfn,
+                     metrics=['mae'])
         
         model_data = model.fit(X, y, 
                              epochs=self.epochs,
