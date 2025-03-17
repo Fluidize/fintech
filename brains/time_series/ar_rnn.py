@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 import tensorflow as tf
-from keras import layers, models, optimizers, callbacks, losses, regularizers
+from keras import layers, models, optimizers, callbacks, losses, regularizers, backend as K
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.metrics import mean_squared_error
@@ -68,10 +68,12 @@ class TimeSeriesPredictor:
         df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
         df['Price_Range'] = (df['High'] - df['Low']) / df['Close']
         
-        # Previous values
-        for period in [1, 2, 3]:
+        shift_periods = [1, 2, 3]
+        for period in shift_periods:
             df[f'Prev{period}_Close'] = df['Close'].shift(period)
             df[f'Prev{period}_Volume'] = df['Volume'].shift(period)
+        std = df['Close'].std()
+        df['Close_ZScore'] = (df['Close'] - df['Close'].mean()) / std #Z-score
         
         # Moving averages (normalized by current price)
         df['MA10'] = df['Close'].rolling(window=10).mean() / df['Close']
@@ -87,9 +89,9 @@ class TimeSeriesPredictor:
         if train_split:
             # Group features by their characteristics
             price_features = ['Open', 'High', 'Low', 'Close']
-            volume_features = ['Volume'] + [f'Prev{period}_Volume' for period in [1, 2, 3]]
+            volume_features = ['Volume'] + [f'Prev{period}_Volume' for period in shift_periods]
             bounded_features = ['RSI']  # Features that are already bounded (e.g., 0-100)
-            normalized_features = ['MA10', 'MA20', 'MA50', 'Price_Range', 'MA10_MA20_Cross']
+            normalized_features = ['MA10', 'MA20', 'MA50', 'Price_Range', 'MA10_MA20_Cross', 'Close_ZScore']
             
             # Remaining features need standardization
             technical_features = [col for col in df.columns 
@@ -114,6 +116,7 @@ class TimeSeriesPredictor:
             X = X[:-1]
             y = y[:-1]
             return X, y
+        
         return df
 
     def _train_model(self, X, y):
@@ -136,10 +139,9 @@ class TimeSeriesPredictor:
         transformer_outputs = [x]
         for i in range(2):
             concat_inputs = layers.Concatenate(name=f'transformer_{i}_concat')(transformer_outputs)
-            
             # Self-attention: sequence attends to itself
             self_attention = layers.MultiHeadAttention(
-                num_heads=num_heads, 
+                num_heads=num_heads,
                 key_dim=embedding_dim//num_heads,
                 name=f'transformer_{i}_self_attention'
             )(
@@ -168,38 +170,51 @@ class TimeSeriesPredictor:
             transformer_outputs.append(ffn)
         x = layers.Concatenate(name='transformer_final_concat')(transformer_outputs)
         
-        # GRU layers with dense connections
         gru_outputs = [x]
         for i in range(self.rnn_count):
-            return_sequences = i < self.rnn_count - 1
-            # Concatenate all previous outputs
-            concat_inputs = layers.Concatenate(name=f'gru_{i}_concat')(gru_outputs)
+            concat_inputs = layers.Concatenate(axis=-1, name=f'gru_{i}_concat')(gru_outputs)
             
+            # Always return sequences for richer temporal features
             gru_out = layers.Bidirectional(layers.GRU(
                     units=self.rnn_width,
-                    return_sequences=return_sequences,
+                    return_sequences=True,
                     kernel_regularizer=regularizers.l1_l2(l1=l1_reg, l2=l2_reg),
                     name=f'gru_layer_{i}'
             ), name=f'bidirectional_gru_{i}')(concat_inputs)
             
+            # Add temporal pooling to capture different temporal scales
+            avg_pool = layers.GlobalAveragePooling1D(name=f'avg_pool_{i}')(gru_out)
+            max_pool = layers.GlobalMaxPooling1D(name=f'max_pool_{i}')(gru_out)
+            
+            # Combine sequence output with pooled features
+            gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
+                gru_out,
+                layers.RepeatVector(K.int_shape(gru_out)[1])(avg_pool),
+                layers.RepeatVector(K.int_shape(gru_out)[1])(max_pool)
+            ])
+            
             gru_outputs.append(gru_out)
         
-        # Final GRU output
-        x = gru_outputs[-1]
+        # Use both sequential and pooled features
+        final_outputs = []
+        for output in gru_outputs:
+            # Global features from pooling
+            avg_features = layers.GlobalAveragePooling1D(name=f'final_avg_pool_{len(final_outputs)}')(output)
+            max_features = layers.GlobalMaxPooling1D(name=f'final_max_pool_{len(final_outputs)}')(output)
+            # Combine global features
+            final_outputs.extend([avg_features, max_features])
+        
+        # Concatenate all features
+        x = layers.Concatenate(axis=-1, name='gru_final_concat')(final_outputs)
         
         # Dense layers with DenseNet-style connections
         dense_outputs = [x]
-        for i in range(self.dense_count):
-            # Concatenate all previous outputs
+        for i in range(self.dense_count): 
             concat_inputs = layers.Concatenate(name=f'dense_{i}_concat')(dense_outputs)
-            
-            # Dense block
             x = layers.Dense(growth_rate, name=f'dense_layer_{i}')(concat_inputs)
             x = layers.LeakyReLU(name=f'leaky_relu_layer_{i}')(x)
             
             dense_outputs.append(x)
-        
-        # Final concatenation of all dense outputs
         x = layers.Concatenate(name='final_concat')(dense_outputs)
         
         x = layers.Dense(self.dense_width, activation='relu', name='transition_layer')(x)
@@ -321,7 +336,7 @@ class TimeSeriesPredictor:
                           shared_xaxes=True, 
                           vertical_spacing=0.05,
                           subplot_titles=('Price Prediction', 
-                                        f'Prediction Error (MSE: {mse:.2f}, MAPE: {mape:.2f}%)',
+                                        f'Percent Prediction Error (MSE: {mse:.2f}, MAPE: {mape:.2f}%)',
                                         f'Training Loss History (Final Loss: {model_data.history["loss"][-1]:.6f})'))
 
         # Price prediction plot
@@ -333,8 +348,8 @@ class TimeSeriesPredictor:
                                line=dict(color='red')), row=1, col=1)
 
         # Error plot
-        error = actual_prices - yhat[:, 3]
-        fig.add_trace(go.Scatter(x=dates, y=error, 
+        percent_error = (np.abs(actual_prices - yhat[:, 3]) / actual_prices) * 100
+        fig.add_trace(go.Scatter(x=dates, y=percent_error, 
                                mode='lines', name='Prediction Error', 
                                line=dict(color='orange')), row=2, col=1)
         fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
