@@ -70,15 +70,20 @@ class TimeSeriesPredictor:
         df['Price_Range'] = (df['High'] - df['Low']) / df['Close']
         
         # Create sequences of previous values
-        sequence_length = 10  # Look back 10 timesteps
-        print(f"Creating features for sequence length: {sequence_length}")
+        self.lagged_length = 5
+        print(f"Creating features for sequence length: {self.lagged_length}")
         
-        for i in range(1, sequence_length + 1):
-            df[f'Prev{i}_Close'] = df['Close'].shift(i)
-            df[f'Prev{i}_Volume'] = df['Volume'].shift(i)
-            df[f'Prev{i}_High'] = df['High'].shift(i)
-            df[f'Prev{i}_Low'] = df['Low'].shift(i)
-            df[f'Prev{i}_Open'] = df['Open'].shift(i)
+        # Create all lagged features at once using pd.concat
+        lagged_features = []
+        for col in ['Close', 'Volume', 'High', 'Low', 'Open']:
+            for i in range(1, self.lagged_length):
+                lagged_features.append(pd.DataFrame({
+                    f'Prev{i}_{col}': df[col].shift(i)
+                }))
+        
+        # Concatenate all lagged features at once
+        if lagged_features:
+            df = pd.concat([df] + lagged_features, axis=1)
         
         std = df['Close'].std()
         df['Close_ZScore'] = (df['Close'] - df['Close'].mean()) / std #Z-score
@@ -99,7 +104,7 @@ class TimeSeriesPredictor:
         if train_split:
             # Group features by their characteristics
             price_features = ['Open', 'High', 'Low', 'Close']
-            volume_features = ['Volume'] + [f'Prev{i}_Volume' for i in range(1, sequence_length)]
+            volume_features = ['Volume'] + [f'Prev{i}_Volume' for i in range(1, self.lagged_length)]
             bounded_features = ['RSI']  # Features that are already bounded (e.g., 0-100)
             normalized_features = ['MA10', 'MA20', 'MA50', 'Price_Range', 'MA10_MA20_Cross', 'Close_ZScore']
             
@@ -127,27 +132,39 @@ class TimeSeriesPredictor:
             X = df.drop(['Datetime'], axis=1)
             y = df[['Open', 'High', 'Low', 'Close', 'Volume']].shift(-1)  # Predict next OHLCV
             
-            X = X[:-1]
-            y = y[:-1]
+            X = X[:-1]  # Remove last row since we don't have target for it
+            y = y[:-1]  # Remove last row since we don't have target for it
             print(f"Final X shape: {X.shape}")
             return X, y
         
         return df
 
     def _train_model(self, X, y):
-        X = X.values.reshape((X.shape[0], 1, X.shape[1]))
-        print(f"Training shapes - X: {X.shape}, y: {y.shape}")
+        self.sequence_length = 25  # Sequence length for temporal information
+        # Create sequences by sliding window
+        n_samples = X.shape[0] - self.sequence_length + 1
+        n_features = X.shape[1]
+        
+        # Create sequences
+        X_sequences = np.zeros((n_samples, self.sequence_length, n_features))
+        for i in range(n_samples):
+            X_sequences[i] = X[i:i + self.sequence_length]
+        
+        # Adjust y to match sequence predictions
+        y = y[self.sequence_length - 1:]
+        
+        print(f"Training shapes - X: {X_sequences.shape}, y: {y.shape}")
         
         l1_reg = 1e-4
         l2_reg = 1e-4
         self.rnn_count = 3
         self.dense_count = 5
         embedding_dim = 32  # Size of embedding space
-        num_heads = X.shape[1] #feature count
+        num_heads = X_sequences.shape[1] #feature count
         ff_dim = 64       # Feed-forward network dimension
         growth_rate = 32  # Number of features added by each dense layer
 
-        inputs = layers.Input(shape=(X.shape[1], X.shape[2]), name='input_layer')
+        inputs = layers.Input(shape=(X_sequences.shape[1], X_sequences.shape[2]), name='input_layer')
     
         x = layers.Dense(embedding_dim, name='embedding_projection')(inputs)
         
@@ -204,9 +221,8 @@ class TimeSeriesPredictor:
             # Combine sequence output with pooled features
             gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
                 gru_out,
-                #vector is repeated to match seq length
-                layers.RepeatVector(1)(avg_pool), #1 IS SEQUENCE LENGTH, CHANGE ACCORDINLY
-                layers.RepeatVector(1)(max_pool)
+                layers.RepeatVector(self.sequence_length)(avg_pool),
+                layers.RepeatVector(self.sequence_length)(max_pool)
             ])
             
             gru_outputs.append(gru_out)
@@ -234,7 +250,6 @@ class TimeSeriesPredictor:
         
         outputs = layers.Dense(5, name='output_layer')(x)
         
-        
         lossfn = losses.Huber(delta=5.0)
         optimizer = optimizers.Adam(learning_rate=1e-5)
         callbacks_list = [
@@ -244,16 +259,13 @@ class TimeSeriesPredictor:
                                       factor=0.5, 
                                       patience=7,
                                       min_lr=1e-6)
-            # callbacks.ModelCheckpoint('best_model.keras', 
-            #                         monitor='val_loss', 
-            #                         save_best_only=True)
         ]
         model = models.Model(inputs=inputs, outputs=outputs)
         model.compile(optimizer=optimizer,
                      loss=lossfn,
                      metrics=['mae'])
         
-        model_data = model.fit(X, y, 
+        model_data = model.fit(X_sequences, y, 
                              epochs=self.epochs,
                              batch_size=32,
                              validation_split=0.1,
@@ -267,14 +279,22 @@ class TimeSeriesPredictor:
         return model, model_data
 
     def _predict(self, model, X):
-        X = X.values.reshape((X.shape[0], 1, X.shape[1]))
-        yhat = model.predict(X)
+        # Create sequences for prediction
+        n_samples = X.shape[0] - self.sequence_length + 1
+        n_features = X.shape[1]
+        
+        # Create sequences
+        X_sequences = np.zeros((n_samples, self.sequence_length, n_features))
+        for i in range(n_samples):
+            X_sequences[i] = X[i:i + self.sequence_length]
+        
+        yhat = model.predict(X_sequences)
         yhat = yhat.squeeze()
         
         # Split predictions into price and volume
         price_predictions = yhat[:, :4]  # take columns from index 0 up to (but not including) index 4
         volume_predictions = yhat[:, 4].reshape(-1, 1)  # Volume
-        volume_predictions_extended = np.zeros((volume_predictions.shape[0], 10))
+        volume_predictions_extended = np.zeros((volume_predictions.shape[0], self.lagged_length))
         volume_predictions_extended[:, 0] = volume_predictions.squeeze()
 
         # Inverse transform price and volume separately
@@ -291,8 +311,9 @@ class TimeSeriesPredictor:
 
     def create_plot(self, data, yhat, model_data, show_graph=False, save_image=False):
         df = self._prepare_data(data.copy(), train_split=False)
-        actual_prices = df['Close'].values[:-1]
-        dates = df['Datetime'].values[:-1]
+        # Adjust actual prices to match prediction length
+        actual_prices = df['Close'].values[self.sequence_length-1:-1]
+        dates = df['Datetime'].values[self.sequence_length-1:-1]
         
         # Calculate metrics
         mse = mean_squared_error(actual_prices, yhat[:, 3])  # Compare with Close prices
@@ -342,7 +363,7 @@ class TimeSeriesPredictor:
             f"RNN: {self.rnn_width} | Dense: {self.dense_width}<br>" +
             f"Total: {model_data.model.count_params():,}<br><br>" +
             f"<b>Training:</b><br>" +
-            f"Batch: 32 | LR: 1e-5"
+            f"Batch: 32 | LR: 1e-5 | Seq: {self.sequence_length}"
         )
         
         fig = make_subplots(rows=3, cols=1, 
@@ -376,7 +397,7 @@ class TimeSeriesPredictor:
         # Add architecture text box in the loss plot
         fig.add_annotation(
             x=1, #align better with loss plot
-            y=1,
+            y=10,
             xref='paper',
             yref='paper',
             text=architecture_text,
@@ -408,7 +429,6 @@ class TimeSeriesPredictor:
     def run(self, save=False):
         data = self._fetch_data(self.ticker, self.chunks, self.interval, self.age_days)
         X, y = self._prepare_data(data)
-        print(X)
         model, model_data = self._train_model(X, y)
         yhat = self._predict(model, X)
         if save: 
@@ -474,8 +494,8 @@ class ModelTesting(TimeSeriesPredictor):
         data = self._extended_predict(self.model, data, model_interval, extension)
         return data
 
-test_client = TimeSeriesPredictor(epochs=15, rnn_width=512, dense_width=256, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
-data, yhat, model_data = test_client.run(save=True)
+test_client = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
+data, yhat, model_data = test_client.run(save=False)
 test_client.create_plot(data, yhat, model_data, show_graph=True)
 
 # Extended prediction testing
