@@ -146,7 +146,7 @@ class TimeSeriesPredictor:
         n_features = X.shape[1]
         
         # Create sequences
-        X_sequences = np.zeros((n_samples, self.sequence_length, n_features))
+        X_sequences = np.zeros((n_samples, self.sequence_length, n_features), dtype=np.float32)
         for i in range(n_samples):
             X_sequences[i] = X[i:i + self.sequence_length]
         
@@ -162,7 +162,7 @@ class TimeSeriesPredictor:
         embedding_dim = 32  # Size of embedding space
         num_heads = X_sequences.shape[1] #feature count
         ff_dim = 64       # Feed-forward network dimension
-        growth_rate = 32  # Number of features added by each dense layer
+        growth_rate = 16  # Number of features added by each dense layer
 
         inputs = layers.Input(shape=(X_sequences.shape[1], X_sequences.shape[2]), name='input_layer')
     
@@ -171,29 +171,27 @@ class TimeSeriesPredictor:
         transformer_outputs = [x]
         for i in range(2):
             concat_inputs = layers.Concatenate(name=f'transformer_{i}_concat')(transformer_outputs)
-            # Self-attention: sequence attends to itself
             self_attention = layers.MultiHeadAttention(
                 num_heads=num_heads,
                 key_dim=embedding_dim//num_heads,
                 name=f'transformer_{i}_self_attention'
             )(
-                query=concat_inputs,    # Current sequence is query
-                key=concat_inputs,      # Attends to itself (key)
-                value=concat_inputs     # Values from same sequence
+                query=concat_inputs,
+                key=concat_inputs,
+                value=concat_inputs
             )
             
-            # Cross-attention with input if not first block
             if i > 0:
                 cross_attention = layers.MultiHeadAttention(
                     num_heads=num_heads,
                     key_dim=embedding_dim//num_heads,
                     name=f'transformer_{i}_cross_attention'
                 )(
-                    query=self_attention,     # Current block's output
-                    key=transformer_outputs[0],   # Original input as key
-                    value=transformer_outputs[0]  # Original input as value
+                    query=self_attention,
+                    key=transformer_outputs[0],
+                    value=transformer_outputs[0]
                 )
-                self_attention = layers.Add(name=f'transformer_{i}_cross_merge')([self_attention, cross_attention]) #add to merge with original input
+                self_attention = layers.Add(name=f'transformer_{i}_cross_merge')([self_attention, cross_attention])
             
             # Position-wise feed-forward network
             ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(self_attention) #expand to higher dimension and compress back
@@ -206,7 +204,6 @@ class TimeSeriesPredictor:
         for i in range(self.rnn_count):
             concat_inputs = layers.Concatenate(axis=-1, name=f'gru_{i}_concat')(gru_outputs)
             
-            # Always return sequences for richer temporal features
             gru_out = layers.Bidirectional(layers.GRU(
                     units=self.rnn_width,
                     return_sequences=True,
@@ -214,11 +211,9 @@ class TimeSeriesPredictor:
                     name=f'gru_layer_{i}'
             ), name=f'bidirectional_gru_{i}')(concat_inputs)
             
-            # Add temporal pooling to capture different temporal scales
             avg_pool = layers.GlobalAveragePooling1D(name=f'avg_pool_{i}')(gru_out)
             max_pool = layers.GlobalMaxPooling1D(name=f'max_pool_{i}')(gru_out)
             
-            # Combine sequence output with pooled features
             gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
                 gru_out,
                 layers.RepeatVector(self.sequence_length)(avg_pool),
@@ -226,17 +221,13 @@ class TimeSeriesPredictor:
             ])
             
             gru_outputs.append(gru_out)
-        # Use both sequential and pooled features
         final_outputs = []
         for output in gru_outputs:
-            # Global features from pooling
             avg_features = layers.GlobalAveragePooling1D(name=f'final_avg_pool_{len(final_outputs)}')(output)
             max_features = layers.GlobalMaxPooling1D(name=f'final_max_pool_{len(final_outputs)}')(output)
-            # Combine global features
             final_outputs.extend([avg_features, max_features])
         x = layers.Concatenate(axis=-1, name='gru_final_concat')(final_outputs)
         
-        # Dense layers with DenseNet-style connections
         dense_outputs = [x]
         for i in range(self.dense_count): 
             concat_inputs = layers.Concatenate(name=f'dense_{i}_concat')(dense_outputs)
@@ -279,11 +270,9 @@ class TimeSeriesPredictor:
         return model, model_data
 
     def _predict(self, model, X):
-        # Create sequences for prediction
         n_samples = X.shape[0] - self.sequence_length + 1
         n_features = X.shape[1]
         
-        # Create sequences
         X_sequences = np.zeros((n_samples, self.sequence_length, n_features))
         for i in range(n_samples):
             X_sequences[i] = X[i:i + self.sequence_length]
@@ -291,17 +280,14 @@ class TimeSeriesPredictor:
         yhat = model.predict(X_sequences)
         yhat = yhat.squeeze()
         
-        # Split predictions into price and volume
-        price_predictions = yhat[:, :4]  # take columns from index 0 up to (but not including) index 4
-        volume_predictions = yhat[:, 4].reshape(-1, 1)  # Volume
+        price_predictions = yhat[:, :4]
+        volume_predictions = yhat[:, 4].reshape(-1, 1)
         volume_predictions_extended = np.zeros((volume_predictions.shape[0], self.lagged_length))
         volume_predictions_extended[:, 0] = volume_predictions.squeeze()
 
-        # Inverse transform price and volume separately
         price_pred = self.scalers['price'].inverse_transform(price_predictions)
         volume_pred = self.scalers['volume'].inverse_transform(volume_predictions_extended)[:, 0]
 
-        # Combine predictions
         final_pred = np.column_stack((price_pred, volume_pred))
         
         print(f"Prediction shape: {final_pred.shape}")
@@ -311,19 +297,15 @@ class TimeSeriesPredictor:
 
     def create_plot(self, data, yhat, model_data, show_graph=False, save_image=False):
         df = self._prepare_data(data.copy(), train_split=False)
-        # Adjust actual prices to match prediction length
         actual_prices = df['Close'].values[self.sequence_length-1:-1]
         dates = df['Datetime'].values[self.sequence_length-1:-1]
         
-        # Calculate metrics
         mse = mean_squared_error(actual_prices, yhat[:, 3])  # Compare with Close prices
         mape = np.mean(np.abs((actual_prices - yhat[:, 3]) / actual_prices)) * 100
         
-        # Get layer information from model
         layer_info = []
-        layers_per_line = 4  # More layers per line since names are shorter
-        
-        # Create short names mapping
+        layers_per_line = 4
+
         layer_names = {
             'InputLayer': 'In',
             'Dense': 'D',
@@ -494,7 +476,7 @@ class ModelTesting(TimeSeriesPredictor):
         data = self._extended_predict(self.model, data, model_interval, extension)
         return data
 
-test_client = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
+test_client = TimeSeriesPredictor(epochs=15, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=3, interval='1m', age_days=0)
 data, yhat, model_data = test_client.run(save=False)
 test_client.create_plot(data, yhat, model_data, show_graph=True)
 
