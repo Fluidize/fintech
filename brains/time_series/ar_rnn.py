@@ -14,6 +14,7 @@ from plotly.subplots import make_subplots
 
 from datetime import datetime, timedelta
 import os
+from rich import print
 
 tf.config.threading.set_intra_op_parallelism_threads(8)
 tf.config.threading.set_inter_op_parallelism_threads(8)
@@ -68,10 +69,17 @@ class TimeSeriesPredictor:
         df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
         df['Price_Range'] = (df['High'] - df['Low']) / df['Close']
         
-        shift_periods = [1, 2, 3]
-        for period in shift_periods:
-            df[f'Prev{period}_Close'] = df['Close'].shift(period)
-            df[f'Prev{period}_Volume'] = df['Volume'].shift(period)
+        # Create sequences of previous values
+        sequence_length = 10  # Look back 10 timesteps
+        print(f"Creating features for sequence length: {sequence_length}")
+        
+        for i in range(1, sequence_length + 1):
+            df[f'Prev{i}_Close'] = df['Close'].shift(i)
+            df[f'Prev{i}_Volume'] = df['Volume'].shift(i)
+            df[f'Prev{i}_High'] = df['High'].shift(i)
+            df[f'Prev{i}_Low'] = df['Low'].shift(i)
+            df[f'Prev{i}_Open'] = df['Open'].shift(i)
+        
         std = df['Close'].std()
         df['Close_ZScore'] = (df['Close'] - df['Close'].mean()) / std #Z-score
         
@@ -85,11 +93,13 @@ class TimeSeriesPredictor:
         df['RSI'] = self._compute_rsi(df['Close'], 14)
 
         df.dropna(inplace=True)
+        print(f"Features after creation: {df.columns.tolist()}")
+        print(f"Total number of features: {len(df.columns)}")
         
         if train_split:
             # Group features by their characteristics
             price_features = ['Open', 'High', 'Low', 'Close']
-            volume_features = ['Volume'] + [f'Prev{period}_Volume' for period in shift_periods]
+            volume_features = ['Volume'] + [f'Prev{i}_Volume' for i in range(1, sequence_length)]
             bounded_features = ['RSI']  # Features that are already bounded (e.g., 0-100)
             normalized_features = ['MA10', 'MA20', 'MA50', 'Price_Range', 'MA10_MA20_Cross', 'Close_ZScore']
             
@@ -97,6 +107,10 @@ class TimeSeriesPredictor:
             technical_features = [col for col in df.columns 
                                if col not in (price_features + volume_features + bounded_features + 
                                             normalized_features + ['Datetime'])]
+            
+            print(f"Price features: {price_features}")
+            print(f"Volume features: {volume_features}")
+            print(f"Technical features: {technical_features}")
             
             # Scale absolute price values with MinMaxScaler
             df[price_features] = self.scalers['price'].fit_transform(df[price_features])
@@ -115,6 +129,7 @@ class TimeSeriesPredictor:
             
             X = X[:-1]
             y = y[:-1]
+            print(f"Final X shape: {X.shape}")
             return X, y
         
         return df
@@ -128,7 +143,7 @@ class TimeSeriesPredictor:
         self.rnn_count = 3
         self.dense_count = 5
         embedding_dim = 32  # Size of embedding space
-        num_heads = X.shape[2] #feature count
+        num_heads = X.shape[1] #feature count
         ff_dim = 64       # Feed-forward network dimension
         growth_rate = 32  # Number of features added by each dense layer
 
@@ -164,7 +179,7 @@ class TimeSeriesPredictor:
                 self_attention = layers.Add(name=f'transformer_{i}_cross_merge')([self_attention, cross_attention]) #add to merge with original input
             
             # Position-wise feed-forward network
-            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(self_attention)
+            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(self_attention) #expand to higher dimension and compress back
             ffn = layers.Dense(embedding_dim, name=f'transformer_{i}_ffn_2')(ffn)
             
             transformer_outputs.append(ffn)
@@ -189,12 +204,12 @@ class TimeSeriesPredictor:
             # Combine sequence output with pooled features
             gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
                 gru_out,
+                #vector is repeated to match seq length
                 layers.RepeatVector(1)(avg_pool), #1 IS SEQUENCE LENGTH, CHANGE ACCORDINLY
                 layers.RepeatVector(1)(max_pool)
             ])
             
             gru_outputs.append(gru_out)
-        
         # Use both sequential and pooled features
         final_outputs = []
         for output in gru_outputs:
@@ -203,8 +218,6 @@ class TimeSeriesPredictor:
             max_features = layers.GlobalMaxPooling1D(name=f'final_max_pool_{len(final_outputs)}')(output)
             # Combine global features
             final_outputs.extend([avg_features, max_features])
-        
-        # Concatenate all features
         x = layers.Concatenate(axis=-1, name='gru_final_concat')(final_outputs)
         
         # Dense layers with DenseNet-style connections
@@ -261,7 +274,7 @@ class TimeSeriesPredictor:
         # Split predictions into price and volume
         price_predictions = yhat[:, :4]  # take columns from index 0 up to (but not including) index 4
         volume_predictions = yhat[:, 4].reshape(-1, 1)  # Volume
-        volume_predictions_extended = np.zeros((volume_predictions.shape[0], 4))
+        volume_predictions_extended = np.zeros((volume_predictions.shape[0], 10))
         volume_predictions_extended[:, 0] = volume_predictions.squeeze()
 
         # Inverse transform price and volume separately
@@ -461,8 +474,8 @@ class ModelTesting(TimeSeriesPredictor):
         data = self._extended_predict(self.model, data, model_interval, extension)
         return data
 
-test_client = TimeSeriesPredictor(epochs=5, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
-data, yhat, model_data = test_client.run(save=False)
+test_client = TimeSeriesPredictor(epochs=15, rnn_width=512, dense_width=256, ticker='BTC-USD', chunks=7, interval='5m', age_days=0)
+data, yhat, model_data = test_client.run(save=True)
 test_client.create_plot(data, yhat, model_data, show_graph=True)
 
 # Extended prediction testing
