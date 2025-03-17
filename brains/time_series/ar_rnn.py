@@ -189,8 +189,8 @@ class TimeSeriesPredictor:
             # Combine sequence output with pooled features
             gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
                 gru_out,
-                layers.RepeatVector(K.int_shape(gru_out)[1])(avg_pool),
-                layers.RepeatVector(K.int_shape(gru_out)[1])(max_pool)
+                layers.RepeatVector(1)(avg_pool), #1 IS SEQUENCE LENGTH, CHANGE ACCORDINLY
+                layers.RepeatVector(1)(max_pool)
             ])
             
             gru_outputs.append(gru_out)
