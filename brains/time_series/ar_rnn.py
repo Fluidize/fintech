@@ -16,8 +16,7 @@ from datetime import datetime, timedelta
 import os
 from rich import print
 
-tf.config.threading.set_intra_op_parallelism_threads(8)
-tf.config.threading.set_inter_op_parallelism_threads(8)
+print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
 def check_for_nan(data, stage):
     nan_count = np.sum(np.isnan(data))
@@ -162,7 +161,7 @@ class TimeSeriesPredictor:
         embedding_dim = 32  # Size of embedding space
         num_heads = X_sequences.shape[1] #feature count
         ff_dim = 64       # Feed-forward network dimension
-        growth_rate = 16  # Number of features added by each dense layer
+        growth_rate = 32  # Number of features added by each dense layer
 
         inputs = layers.Input(shape=(X_sequences.shape[1], X_sequences.shape[2]), name='input_layer')
     
