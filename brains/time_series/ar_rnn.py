@@ -28,6 +28,7 @@ class TimeSeriesPredictor:
         self.epochs = epochs
         self.rnn_width = rnn_width
         self.dense_width = dense_width
+        self.sequence_length = 25 
         self.ticker = ticker
         self.chunks = chunks
         self.interval = interval
@@ -112,10 +113,6 @@ class TimeSeriesPredictor:
                                if col not in (price_features + volume_features + bounded_features + 
                                             normalized_features + ['Datetime'])]
             
-            print(f"Price features: {price_features}")
-            print(f"Volume features: {volume_features}")
-            print(f"Technical features: {technical_features}")
-            
             # Scale absolute price values with MinMaxScaler
             df[price_features] = self.scalers['price'].fit_transform(df[price_features])
             
@@ -138,8 +135,7 @@ class TimeSeriesPredictor:
         
         return df
 
-    def _train_model(self, X, y):
-        self.sequence_length = 25  # Sequence length for temporal information
+    def _train_model(self, X, y): # Sequence length for temporal information
         # Create sequences by sliding window
         n_samples = X.shape[0] - self.sequence_length + 1
         n_features = X.shape[1]
@@ -407,14 +403,18 @@ class TimeSeriesPredictor:
             fig.write_image(f"images/{self.ticker}_{self.interval}_{model_data.model.count_params()}.png")
         return fig
 
+    def _prompt_save(self, model):
+        if input("Save? (y/n) ").lower() == 'y':
+            model.save(f'{self.ticker}_{self.interval}_{model.count_params()}.keras', overwrite=True)
+            print(f'Model Saved to {os.getcwd()}')
+
     def run(self, save=False):
         data = self._fetch_data(self.ticker, self.chunks, self.interval, self.age_days)
         X, y = self._prepare_data(data)
         model, model_data = self._train_model(X, y)
         yhat = self._predict(model, X)
         if save: 
-            model.save(f'{self.ticker}_{self.interval}_{model.count_params()}.keras', overwrite=True)
-            print(f'Model Saved to {os.getcwd()}')
+            self._prompt_save(model)
         return data, yhat, model_data
 
 class ModelTesting(TimeSeriesPredictor):
@@ -475,12 +475,11 @@ class ModelTesting(TimeSeriesPredictor):
         data = self._extended_predict(self.model, data, model_interval, extension)
         return data
 
-test_client = TimeSeriesPredictor(epochs=15, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=3, interval='1m', age_days=0)
-data, yhat, model_data = test_client.run(save=False)
-test_client.create_plot(data, yhat, model_data, show_graph=True)
+# test_client = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=3, interval='1m', age_days=0)
+# data, yhat, model_data = test_client.run(save=True)
+# test_client.create_plot(data, yhat, model_data, show_graph=True)
 
-# Extended prediction testing
-# test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
-# test_client.load_model(model_name="best_model.keras")
-# original_data, predicted_data = test_client.run(extension=100)
-# test_client.create_test_plot(original_data, predicted_data, show_graph=True)
+test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
+test_client.load_model(model_name="BTC-USD_1m_11476582.keras")
+original_data, predicted_data = test_client.run(extension=100)
+test_client.create_test_plot(original_data, predicted_data, show_graph=True)
