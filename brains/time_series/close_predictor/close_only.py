@@ -124,7 +124,7 @@ class TimeSeriesPredictor:
                 df[technical_features] = self.scalers['technical'].fit_transform(df[technical_features])
             
             X = df.drop(['Datetime'], axis=1)
-            y = df[['Open', 'High', 'Low', 'Close', 'Volume']].shift(-1)  # Predict next OHLCV
+            y = df['Close'].shift(-1)
             
             X = X[:-1]  # Remove last row since we don't have target for it
             y = y[:-1]  # Remove last row since we don't have target for it
@@ -232,7 +232,7 @@ class TimeSeriesPredictor:
         
         x = layers.Dense(self.dense_width, activation='relu', name='transition_layer')(x)
         
-        outputs = layers.Dense(5, name='output_layer')(x)
+        outputs = layers.Dense(1, name='output_layer')(x)
         
         lossfn = losses.Huber(delta=5.0)
         optimizer = optimizers.Adam(learning_rate=1e-5)
@@ -272,29 +272,18 @@ class TimeSeriesPredictor:
         
         yhat = model.predict(X_sequences)
         yhat = yhat.squeeze()
-        
-        price_predictions = yhat[:, :4]
-        volume_predictions = yhat[:, 4].reshape(-1, 1)
-        volume_predictions_extended = np.zeros((volume_predictions.shape[0], self.lagged_length))
-        volume_predictions_extended[:, 0] = volume_predictions.squeeze()
-
-        price_pred = self.scalers['price'].inverse_transform(price_predictions)
-        volume_pred = self.scalers['volume'].inverse_transform(volume_predictions_extended)[:, 0]
-
-        final_pred = np.column_stack((price_pred, volume_pred))
-        
-        print(f"Prediction shape: {final_pred.shape}")
-        print(f"Price prediction range: min={np.min(final_pred[:, :4]):.2f}, max={np.max(final_pred[:, :4]):.2f}")
-        print(f"Volume prediction range: min={np.min(final_pred[:, 4]):.2f}, max={np.max(final_pred[:, 4]):.2f}")
-        return final_pred
+        yhat_extended = np.zeros((yhat.shape[0], 4))
+        yhat_extended[:, 3] = yhat
+        price_pred = self.scalers['price'].inverse_transform(yhat_extended)[:, 3]
+        return price_pred
 
     def create_plot(self, data, yhat, model_data, show_graph=False, save_image=False):
         df = self._prepare_data(data.copy(), train_split=False)
         actual_prices = df['Close'].values[self.sequence_length-1:-1]
         dates = df['Datetime'].values[self.sequence_length-1:-1]
         
-        mse = mean_squared_error(actual_prices, yhat[:, 3])  # Compare with Close prices
-        mape = np.mean(np.abs((actual_prices - yhat[:, 3]) / actual_prices)) * 100
+        mse = mean_squared_error(actual_prices, yhat)  # Compare with Close prices
+        mape = np.mean(np.abs((actual_prices - yhat) / actual_prices)) * 100
         
         layer_info = []
         layers_per_line = 4
@@ -352,12 +341,12 @@ class TimeSeriesPredictor:
         fig.add_trace(go.Scatter(x=dates, y=actual_prices, 
                                mode='lines', name='Actual Close', 
                                line=dict(color='blue')), row=1, col=1)
-        fig.add_trace(go.Scatter(x=dates, y=yhat[:, 3], 
+        fig.add_trace(go.Scatter(x=dates, y=yhat, 
                                mode='lines', name='Predicted Close', 
                                line=dict(color='red')), row=1, col=1)
 
         # Error plot
-        percent_error = (np.abs(actual_prices - yhat[:, 3]) / actual_prices) * 100
+        percent_error = (np.abs(actual_prices - yhat) / actual_prices) * 100
         fig.add_trace(go.Scatter(x=dates, y=percent_error, 
                                mode='lines', name='Prediction Error', 
                                line=dict(color='orange')), row=2, col=1)
@@ -438,45 +427,24 @@ class ModelTesting(TimeSeriesPredictor):
 
         return fig
 
-    def _extended_predict(self, model, data, interval, extension=10):
-        # PARSE INTO A TIMEDELTA
-        number = int(interval[:-1])  # Take all characters except the last one as the number
-        unit = interval[-1]  # Last character will be the unit (e.g., 'm', 'h')
-
-        if unit == 'm':
-            extended_time = timedelta(minutes=number)
-        elif unit == 'h':
-            extended_time = timedelta(hours=number)
-        elif unit == 'd':
-            extended_time = timedelta(days=number)
-        else:
-            raise ValueError("Unsupported unit, please use 'm' for minutes or 'h' for hours.")
-          
+    def _test_predict(self, model, data, extension=10):
         original_data = data.copy()
-        predicted_data = data
+        
+        X, _ = self._prepare_data(original_data)
+        yhat = self._predict(model, X)
+        new_close = yhat[-1]
+        
+        return new_close
 
-        for i in range(extension):
-            # Use only the last row for prediction
-            X, _ = self._prepare_data(predicted_data)
-            yhat = self._predict(model, X)
-            
-            new_data = pd.DataFrame(yhat[-1].reshape(1, -1), columns=original_data.columns[1:6]) #only ohlcv
-            new_data['Datetime'] = predicted_data['Datetime'].iloc[-1] + extended_time
-            predicted_data = pd.concat([predicted_data, new_data], axis=0)
-
-        return original_data, predicted_data
-
-    def run(self, extension=10):
+    def run(self, data=None):
         model_interval = self.model_filename.split("_")[1]
-        data = self._fetch_data(self.ticker, self.chunks, self.interval, self.age_days)
-        data = self._extended_predict(self.model, data, model_interval, extension)
-        return data
+        if data is None:
+            data = self._fetch_data(self.ticker, self.chunks, self.interval, self.age_days)
+        prediction = self._test_predict(self.model, data)
+        return data, prediction
 
-# test_client = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=3, interval='1m', age_days=0)
-# data, yhat, model_data = test_client.run(save=True)
-# test_client.create_plot(data, yhat, model_data, show_graph=True)
 
-test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
-test_client.load_model(model_name="BTC-USD_1m_11476582.keras")
-original_data, predicted_data = test_client.run(extension=50)
-test_client.create_test_plot(original_data, predicted_data, show_graph=True)
+# test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
+# test_client.load_model(model_name="BTC-USD_1m_11476582.keras")
+# original_data, predicted_data = test_client.run(extension=50)
+# test_client.create_test_plot(original_data, predicted_data, show_graph=True)
