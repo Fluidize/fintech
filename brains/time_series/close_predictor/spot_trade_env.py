@@ -69,6 +69,7 @@ class Portfolio:
             'cash_remaining': self.cash,
             'timestamp': timestamp
         })
+        print(f"[green]Bought {quantity} shares of {symbol} at {price:.2f} for {cost:.2f}[/green]")
         return True
     
     def sell(self, symbol: str, quantity: float, price: float, timestamp: datetime) -> bool:
@@ -103,6 +104,7 @@ class Portfolio:
             'cash_remaining': self.cash,
             'timestamp': timestamp
         })
+        print(f"[red]Sold {quantity} shares of {symbol} at {price:.2f} for {proceeds:.2f}[/red]")
         return True
     
     def update_positions(self, current_prices: Dict[str, pd.Series]):
@@ -180,14 +182,28 @@ class TradingEnvironment:
             data.columns = data.columns.droplevel(1)
             data.reset_index(inplace=True)
             data.rename(columns={'index': 'Datetime'}, inplace=True)
-            self.data[symbol] = pd.DataFrame(data)
-            
+            data.rename(columns={'Date': 'Datetime'}, inplace=True)
+            self.data[symbol] = pd.DataFrame(data)  
             self.context[symbol] = self.data[symbol].iloc[:self.context_length].copy()
-            
-        # Find the minimum length among all datasets
+
         min_length = min(len(df) for df in self.data.values())
+        for symbol in self.symbols:
+            self.data[symbol] = self.data[symbol].iloc[-min_length:]
+            
+        print(f"Fetched {min_length} data points for each symbol")
+
+    def fetch_1d_data(self, days: int = 365):
+        for symbol in self.symbols:
+            data = yf.download(symbol, start=datetime.now() - timedelta(days=days), end=datetime.now(), interval='1d')
+            data.sort_index(inplace=True)
+            data.columns = data.columns.droplevel(1)
+            data.reset_index(inplace=True)
+            data.rename(columns={'index': 'Datetime'}, inplace=True)
+            data.rename(columns={'Date': 'Datetime'}, inplace=True) #1d data has Date instead of Datetime
+            self.data[symbol] = pd.DataFrame(data)
+            self.context[symbol] = self.data[symbol].iloc[:self.context_length].copy()
         
-        # Trim all datasets to the same length
+        min_length = min(len(df) for df in self.data.values())
         for symbol in self.symbols:
             self.data[symbol] = self.data[symbol].iloc[-min_length:]
             
@@ -306,30 +322,46 @@ def RSI_Strategy(env: TradingEnvironment, context, prices):
 
 def Custom_Strategy(env: TradingEnvironment, context, prices):
     current_close = prices['Close']
+    
+    delta_p = context['Close'].diff()
+    gain = delta_p.where(delta_p > 0, 0)
+    loss = -delta_p.where(delta_p < 0, 0)
 
-    if context['Close'].iloc[-1] > context['Close'].iloc[-2]:
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - 100 / (1 + rs)
+
+    current_rsi = rsi.iloc[-1]
+
+    if (current_close > context['Close'].iloc[-2]) and (current_close > context['Close'].iloc[-3]):
         env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+    elif (current_close < context['Close'].iloc[-2]) and (current_close < context['Close'].iloc[-3]):
+        env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+
+def RNN_Strategy(env: TradingEnvironment, context, prices):
+    from close_only import ModelTesting
+    model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
+    model.load_model('BTC-USD_5m_11476066.keras')
 
 if __name__ == "__main__":
-    # from close_only import ModelTesting
-    # model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
-    # model.load_model('BTC-USD_5m_11476066.keras')
 
     env = TradingEnvironment(
         symbols=['BTC-USD'],
         initial_capital=100000.0,
-        chunks=3,
-        interval='5m',
+        chunks=365,
+        interval='1d',
         age_days=1
     )
-    env.fetch_data() #init data
-            
+
+    env.fetch_1d_data(days=1000) #init 1d data
+
     while env.step():
         current_state = env.get_state()
-        context = current_state['context']['BTC-USD'] #context includes current price
-        prices = current_state['prices']['BTC-USD'] #current priceA
+        context = current_state['context'][env.symbols[0]] #context includes current price
+        prices = current_state['prices'][env.symbols[0]] #current priceA
 
-        RSI_Strategy(env, context, prices)
-        print(len(env.portfolio.trade_history))
+        Custom_Strategy(env, context, prices)
         
     env.create_performance_plot(show_graph=True)
