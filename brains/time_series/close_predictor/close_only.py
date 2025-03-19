@@ -18,6 +18,9 @@ from rich import print
 
 print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
+tf.config.threading.set_intra_op_parallelism_threads(4)
+tf.config.threading.set_inter_op_parallelism_threads(4)
+
 def check_for_nan(data, stage):
     nan_count = np.sum(np.isnan(data))
     print(f"NaNs found at {stage}: {nan_count}")
@@ -71,7 +74,6 @@ class TimeSeriesPredictor:
         
         # Create sequences of previous values
         self.lagged_length = 5
-        print(f"Creating features for sequence length: {self.lagged_length}")
         
         # Create all lagged features at once using pd.concat
         lagged_features = []
@@ -235,7 +237,7 @@ class TimeSeriesPredictor:
         outputs = layers.Dense(1, name='output_layer')(x)
         
         lossfn = losses.Huber(delta=5.0)
-        optimizer = optimizers.Adam(learning_rate=1e-5)
+        optimizer = optimizers.Adam(learning_rate=1e-3)
         callbacks_list = [
             callbacks.EarlyStopping(monitor='val_loss', patience=15,
                                   restore_best_weights=True),
@@ -436,13 +438,16 @@ class ModelTesting(TimeSeriesPredictor):
         
         return new_close
 
-    def run(self, data=None):
+    def run(self, input_data=None):
         model_interval = self.model_filename.split("_")[1]
-        if data is None:
+        if input_data is None:
             data = self._fetch_data(self.ticker, self.chunks, self.interval, self.age_days)
         prediction = self._test_predict(self.model, data)
-        return data, prediction
+        return input_data, prediction
 
+# train = TimeSeriesPredictor(epochs=100, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
+# data, yhat, model_data = train.run(save=True)
+# train.create_plot(data, yhat, model_data, show_graph=True, save_image=True)
 
 # test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
 # test_client.load_model(model_name="BTC-USD_1m_11476582.keras")
