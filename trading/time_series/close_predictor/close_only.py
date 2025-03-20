@@ -444,9 +444,9 @@ class ModelTesting(TimeSeriesPredictor):
         prediction = self._test_predict(self.model, input_data)
         return input_data, prediction
 
-train = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
-data, yhat, model_data = train.run(save=True)
-train.create_plot(data, yhat, model_data, show_graph=True, save_image=True)
+# train = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
+# data, yhat, model_data = train.run(save=True)
+# train.create_plot(data, yhat, model_data, show_graph=True, save_image=True)
 
 # test_client = ModelTesting(ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
 # test_client.load_model(model_name="BTC-USD_1m_11476582.keras")

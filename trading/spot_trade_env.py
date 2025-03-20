@@ -228,17 +228,27 @@ class TradingEnvironment:
         return self.data[self.symbols[0]].iloc[self.current_index]['Datetime']
     
     def step(self) -> bool:
+        extended_context = False
+
         if self.current_index >= len(self.data[self.symbols[0]]) - 1:
             return False
             
         self.current_index += 1
         
-        for symbol in self.symbols:
-            current_data = self.data[symbol].iloc[self.current_index]
-            self.context[symbol] = pd.concat([
-                self.context[symbol],
-                pd.DataFrame([current_data])
-            ]).reset_index(drop=True)
+        if extended_context:
+            for symbol in self.symbols:
+                current_data = self.data[symbol].iloc[self.current_index]
+                self.context[symbol] = pd.concat([
+                    self.context[symbol],
+                    pd.DataFrame([current_data])
+                ]).reset_index(drop=True)
+        else:
+            for symbol in self.symbols:
+                current_data = self.data[symbol].iloc[self.current_index]
+                self.context[symbol] = pd.concat([
+                    self.context[symbol][-self.context_length+1:],
+                    pd.DataFrame([current_data])
+                ]).reset_index(drop=True)
         
         current_prices = self.get_current_prices()
         self.portfolio.update_positions(current_prices)
@@ -267,15 +277,18 @@ class TradingEnvironment:
         max_drawdown = max(self.portfolio.pct_pnl_history) - min(self.portfolio.pct_pnl_history)
         gains = list(filter(lambda x: x > 0, self.portfolio.pnl_history))
         losses = list(filter(lambda x: x < 0, self.portfolio.pnl_history))
-        profit_factor = sum(gains) / abs(sum(losses))
-        try:
+
+        if len(gains) == 0 or len(losses) == 0:
+            profit_factor = np.nan
+            RR_ratio = np.nan
+            win_rate = np.nan
+            optimal_wr = np.nan
+        else:
+            profit_factor = sum(gains) / abs(sum(losses))
             RR_ratio = (sum(gains) / len(gains)) / abs(sum(losses) / len(losses))
-        except:
-            RR_ratio = 0
-
-
-        win_rate = len(gains) / (len(gains) + len(losses))
-        optimal_wr = 1 / (RR_ratio + 1)
+            win_rate = len(gains) / (len(gains) + len(losses))
+            optimal_wr = 1 / (RR_ratio + 1)
+        
         return f"{self.symbols[0]} {self.interval} | PnL: {self.portfolio.total_profit_loss_pct:.2f}% | Max DD: {max_drawdown:.2f}% | PF: {profit_factor:.2f} | RR Ratio:{RR_ratio:.2f} | WR: {win_rate:.2f} | Optimal WR: {optimal_wr:.2f}"
 
     def create_performance_plot(self, show_graph: bool = False):
@@ -317,30 +330,43 @@ class Backtest:
     def __init__(self, env: TradingEnvironment):
         self.env = env
 
-    def MA(self, env: TradingEnvironment, context, current_ohlcv):
-        ma10 = context['Close'].rolling(window=10).mean().iloc[-1]
-        ma20 = context['Close'].rolling(window=20).mean().iloc[-1]
-        ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
-        current_close = current_ohlcv['Close']
-        
-        if ma10 > ma20 and ma20 > ma50:
-            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
-        elif ma10 < ma20 and ma20 < ma50:
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
-
-    def RSI(self, env: TradingEnvironment, context, current_ohlcv):
-        current_close = current_ohlcv['Close']
-
+    def _calculate_rsi(self, context, period=14):
         delta_p = context['Close'].diff()
         gain = delta_p.where(delta_p > 0, 0)
         loss = -delta_p.where(delta_p < 0, 0)
 
-        avg_gain = gain.rolling(window=14).mean()
-        avg_loss = loss.rolling(window=14).mean()
+        avg_gain = gain.rolling(window=period).mean()
+        avg_loss = loss.rolling(window=period).mean()
 
         rs = avg_gain / avg_loss
         rsi = 100 - 100 / (1 + rs)
+        return rsi
+    
+    def _calculate_macd(self, context, fast_period=12, slow_period=26, signal_period=9):
+        fast_ema = context['Close'].ewm(span=fast_period, adjust=False).mean()
+        slow_ema = context['Close'].ewm(span=slow_period, adjust=False).mean()
 
+        macd_line = fast_ema - slow_ema
+        signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+        histogram = macd_line - signal_line
+
+        return macd_line, signal_line, histogram
+        
+    def MA(self, env: TradingEnvironment, context, current_ohlcv):
+        ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
+        ma100 = context['Close'].rolling(window=200).mean().iloc[-1]
+
+        current_close = current_ohlcv['Close']
+
+        if current_close > ma50 and current_close > ma100:
+            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+        elif current_close < ma50 and current_close < ma100:
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+
+    def RSI(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+
+        rsi = self._calculate_rsi(context, 28)
         current_rsi = rsi.iloc[-1]
 
         if current_rsi < 30:
@@ -348,12 +374,35 @@ class Backtest:
         elif current_rsi > 70:
             env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
 
+
+    def MACD(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+
+        macd_line, signal_line, histogram = self._calculate_macd(context)
+        current_macd_line = macd_line.iloc[-1]
+        current_signal_line = signal_line.iloc[-1]
+        current_histogram = histogram.iloc[-1]
+        if current_macd_line > current_signal_line and current_histogram > 30:
+            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+        elif current_macd_line < current_signal_line and current_histogram < -30:
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+        
     def Custom(self, env: TradingEnvironment, context, current_ohlcv):
         current_close = current_ohlcv['Close']
 
-        if (current_close > context['Close'].iloc[-2]):
+        rsi = self._calculate_rsi(context, 28)
+        current_rsi = rsi.iloc[-1]
+        macd_line, signal_line, histogram = self._calculate_macd(context)
+        current_macd_line = macd_line.iloc[-1]
+        current_signal_line = signal_line.iloc[-1]
+        current_histogram = histogram.iloc[-1]
+
+        buy_conditions = [current_close > context['Close'].iloc[-2], current_macd_line > current_signal_line]
+        sell_conditions = [current_close < context['Close'].iloc[-2], current_macd_line < current_signal_line]
+
+        if all(buy_conditions):
             env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
-        elif (current_close < context['Close'].iloc[-2]):
+        elif all(sell_conditions):
             env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
 
     def RNN(self, env: TradingEnvironment, context, current_ohlcv, model):
@@ -385,15 +434,15 @@ class Backtest:
         print("Starting Backtest")
         progress_bar = tqdm(total=len(env.data[env.symbols[0]]))
 
-        model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
-        model.load_model(r'BTC-USD_5m_11476066.keras')
+        # model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
+        # model.load_model(r'BTC-USD_5m_11476066.keras')
 
         while env.step():
             current_state = env.get_state()
             context = current_state['context'][env.symbols[0]] #context includes current price
             current_ohlcv = current_state['prices'][env.symbols[0]] #current ohlcv
 
-            self.MA(env, context, current_ohlcv)
+            self.MACD(env, context, current_ohlcv)
             progress_bar.update(1)
         progress_bar.close()
 
@@ -401,6 +450,6 @@ class Backtest:
 
         env.create_performance_plot(show_graph=True)
 
-env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=100000, chunks=5, interval='5m', age_days=10)
+env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=100000, chunks=29, interval='5m', age_days=10)
 backtest = Backtest(env)
 backtest.run()
