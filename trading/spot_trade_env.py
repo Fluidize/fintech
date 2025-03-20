@@ -8,6 +8,8 @@ from rich import print
 from tqdm import tqdm
 import plotly.graph_objects as go
 
+from time_series.close_predictor.close_only import ModelTesting
+
 @dataclass
 class Position:
     symbol: str
@@ -266,7 +268,11 @@ class TradingEnvironment:
         gains = list(filter(lambda x: x > 0, self.portfolio.pnl_history))
         losses = list(filter(lambda x: x < 0, self.portfolio.pnl_history))
         profit_factor = sum(gains) / abs(sum(losses))
-        RR_ratio = (sum(gains) / len(gains)) / abs(sum(losses) / len(losses))
+        try:
+            RR_ratio = (sum(gains) / len(gains)) / abs(sum(losses) / len(losses))
+        except:
+            RR_ratio = 0
+
 
         win_rate = len(gains) / (len(gains) + len(losses))
         optimal_wr = 1 / (RR_ratio + 1)
@@ -307,71 +313,94 @@ class TradingEnvironment:
             fig.show()
         return fig
 
-def MA_Crossover_Strategy(env: TradingEnvironment, context, prices):
-    ma10 = context['Close'].rolling(window=10).mean().iloc[-1]
-    ma20 = context['Close'].rolling(window=20).mean().iloc[-1]
-    ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
-    current_close = prices['Close']
+class Backtest:
+    def __init__(self, env: TradingEnvironment):
+        self.env = env
+
+    def MA(self, env: TradingEnvironment, context, current_ohlcv):
+        ma10 = context['Close'].rolling(window=10).mean().iloc[-1]
+        ma20 = context['Close'].rolling(window=20).mean().iloc[-1]
+        ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
+        current_close = current_ohlcv['Close']
+        
+        if ma10 > ma20 and ma20 > ma50:
+            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
+        elif ma10 < ma20 and ma20 < ma50:
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
+
+    def RSI(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+
+        delta_p = context['Close'].diff()
+        gain = delta_p.where(delta_p > 0, 0)
+        loss = -delta_p.where(delta_p < 0, 0)
+
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+
+        rs = avg_gain / avg_loss
+        rsi = 100 - 100 / (1 + rs)
+
+        current_rsi = rsi.iloc[-1]
+
+        if current_rsi < 30:
+            env.portfolio.buy('BTC-USD',0.1, current_close, env.get_current_timestamp())
+        elif current_rsi > 70:
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+
+    def Custom(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+
+        if (current_close > context['Close'].iloc[-2]):
+            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+        elif (current_close < context['Close'].iloc[-2]):
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+
+    def RNN(self, env: TradingEnvironment, context, current_ohlcv, model):
+        input_data, prediction = model.run(context)
+        current_close = current_ohlcv['Close']
+
+        if prediction > current_close:
+            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+        else:
+            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
     
-    if ma10 > ma20 and ma20 > ma50:
-        env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
-    elif ma10 < ma20 and ma20 < ma50:
-        env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp(), verbose=False)
+    def Perfect(self, env, context, current_ohlcv):
+        #perfect strategy
+        index = env.current_index
+        try:
+            if context['Close'].iloc[-1] < env.data[env.symbols[0]]['Close'].iloc[index+1]:
+                env.portfolio.buy_max('BTC-USD', current_ohlcv['Close'], env.get_current_timestamp())
+            elif context['Close'].iloc[-1] > env.data[env.symbols[0]]['Close'].iloc[index+1]:
+                env.portfolio.sell_max('BTC-USD', current_ohlcv['Close'], env.get_current_timestamp())
+            print(env.portfolio.total_profit_loss_pct)
+        except:
+            pass
+    
 
-def RSI_Strategy(env: TradingEnvironment, context, prices):
-    current_close = prices['Close']
+    def run(self, strategy=None):
+        env = self.env
 
-    delta_p = context['Close'].diff()
-    gain = delta_p.where(delta_p > 0, 0)
-    loss = -delta_p.where(delta_p < 0, 0)
+        env.fetch_data()
+        print("Starting Backtest")
+        progress_bar = tqdm(total=len(env.data[env.symbols[0]]))
 
-    avg_gain = gain.rolling(window=14).mean()
-    avg_loss = loss.rolling(window=14).mean()
+        model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
+        model.load_model(r'BTC-USD_5m_11476066.keras')
 
-    rs = avg_gain / avg_loss
-    rsi = 100 - 100 / (1 + rs)
+        while env.step():
+            current_state = env.get_state()
+            context = current_state['context'][env.symbols[0]] #context includes current price
+            current_ohlcv = current_state['prices'][env.symbols[0]] #current ohlcv
 
-    current_rsi = rsi.iloc[-1]
+            self.MA(env, context, current_ohlcv)
+            progress_bar.update(1)
+        progress_bar.close()
 
-    if current_rsi < 30:
-        env.portfolio.buy('BTC-USD',0.1, current_close, env.get_current_timestamp())
-    elif current_rsi > 70:
-        env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+        print(env.get_summary())
 
-def Custom_Strategy(env: TradingEnvironment, context, prices):
-    current_close = prices['Close']
+        env.create_performance_plot(show_graph=True)
 
-    if (current_close > context['Close'].iloc[-2]) and (current_close > context['Close'].iloc[-3]):
-        env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
-    elif (current_close < context['Close'].iloc[-2]) and (current_close < context['Close'].iloc[-3]):
-        env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
-
-def RNN_Strategy(env: TradingEnvironment, context, prices):
-    from time_series.close_predictor.close_only import ModelTesting
-    model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
-    model.load_model('BTC-USD_5m_11476066.keras')
-
-if __name__ == "__main__":
-    env = TradingEnvironment(
-        symbols=['BTC-USD'],
-        initial_capital=100000.0,
-        chunks=29,
-        interval='1m',
-        age_days=0
-    )
-    env.fetch_data()
-
-    print("Starting Backtest")
-    progress_bar = tqdm(total=len(env.data[env.symbols[0]]))
-    while env.step():
-        current_state = env.get_state()
-        context = current_state['context'][env.symbols[0]] #context includes current price
-        prices = current_state['prices'][env.symbols[0]] #current priceA
-
-        MA_Crossover_Strategy(env, context, prices)
-        progress_bar.update(1)
-    progress_bar.close()
-
-    print(env.get_summary())
-
-    env.create_performance_plot(show_graph=True)
+env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=100000, chunks=5, interval='5m', age_days=10)
+backtest = Backtest(env)
+backtest.run()

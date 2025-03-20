@@ -150,102 +150,59 @@ class TimeSeriesPredictor:
         
         print(f"Training shapes - X: {X_sequences.shape}, y: {y.shape}")
         
-        l1_reg = 1e-4
-        l2_reg = 1e-4
-        self.rnn_count = 3
-        self.dense_count = 5
-        embedding_dim = 32  # Size of embedding space
-        num_heads = X_sequences.shape[1] #feature count
-        ff_dim = 64       # Feed-forward network dimension
-        growth_rate = 32  # Number of features added by each dense layer
-
         inputs = layers.Input(shape=(X_sequences.shape[1], X_sequences.shape[2]), name='input_layer')
-    
-        x = layers.Dense(embedding_dim, name='embedding_projection')(inputs)
         
-        transformer_outputs = [x]
-        for i in range(2):
-            concat_inputs = layers.Concatenate(name=f'transformer_{i}_concat')(transformer_outputs)
-            self_attention = layers.MultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=embedding_dim//num_heads,
-                name=f'transformer_{i}_self_attention'
-            )(
-                query=concat_inputs,
-                key=concat_inputs,
-                value=concat_inputs
-            )
-            
-            if i > 0:
-                cross_attention = layers.MultiHeadAttention(
-                    num_heads=num_heads,
-                    key_dim=embedding_dim//num_heads,
-                    name=f'transformer_{i}_cross_attention'
-                )(
-                    query=self_attention,
-                    key=transformer_outputs[0],
-                    value=transformer_outputs[0]
-                )
-                self_attention = layers.Add(name=f'transformer_{i}_cross_merge')([self_attention, cross_attention])
-            
-            # Position-wise feed-forward network
-            ffn = layers.Dense(ff_dim, activation="relu", name=f'transformer_{i}_ffn_1')(self_attention) #expand to higher dimension and compress back
-            ffn = layers.Dense(embedding_dim, name=f'transformer_{i}_ffn_2')(ffn)
-            
-            transformer_outputs.append(ffn)
-        x = layers.Concatenate(name='transformer_final_concat')(transformer_outputs)
+        x = layers.Embedding(
+            input_dim=X_sequences.shape[2],
+            output_dim=X_sequences.shape[2],
+            name='embedding'
+        )(inputs)
+
+        x = layers.MultiHeadAttention(
+            num_heads=X_sequences.shape[2] * 2,
+            key_dim=X_sequences.shape[2],
+            name='multi_head_attention'
+        )(
+            query=inputs,
+            key=inputs,
+            value=inputs
+        )
+
+        x1 = layers.Bidirectional(layers.GRU(
+            units=self.rnn_width,
+            return_sequences=True,
+            kernel_regularizer=regularizers.l2(1e-4),
+            name='gru_1',
+        ))(inputs)
+        x2 = layers.Bidirectional(layers.GRU(
+            units=self.rnn_width,
+            return_sequences=True,
+            kernel_regularizer=regularizers.l2(1e-4),
+            name='gru_2',
+        ))(x1)
+        x = layers.Add(name='skip_connection')([x1, x2])
         
-        gru_outputs = [x]
-        for i in range(self.rnn_count):
-            concat_inputs = layers.Concatenate(axis=-1, name=f'gru_{i}_concat')(gru_outputs)
-            
-            gru_out = layers.Bidirectional(layers.GRU(
-                    units=self.rnn_width,
-                    return_sequences=True,
-                    kernel_regularizer=regularizers.l1_l2(l1=l1_reg, l2=l2_reg),
-                    name=f'gru_layer_{i}'
-            ), name=f'bidirectional_gru_{i}')(concat_inputs)
-            
-            avg_pool = layers.GlobalAveragePooling1D(name=f'avg_pool_{i}')(gru_out)
-            max_pool = layers.GlobalMaxPooling1D(name=f'max_pool_{i}')(gru_out)
-            
-            gru_out = layers.Concatenate(axis=-1, name=f'gru_features_{i}')([
-                gru_out,
-                layers.RepeatVector(self.sequence_length)(avg_pool),
-                layers.RepeatVector(self.sequence_length)(max_pool)
-            ])
-            
-            gru_outputs.append(gru_out)
-        final_outputs = []
-        for output in gru_outputs:
-            avg_features = layers.GlobalAveragePooling1D(name=f'final_avg_pool_{len(final_outputs)}')(output)
-            max_features = layers.GlobalMaxPooling1D(name=f'final_max_pool_{len(final_outputs)}')(output)
-            final_outputs.extend([avg_features, max_features])
-        x = layers.Concatenate(axis=-1, name='gru_final_concat')(final_outputs)
+        # x = layers.GlobalAveragePooling1D(name='global_pool')(x)
         
-        dense_outputs = [x]
-        for i in range(self.dense_count): 
-            concat_inputs = layers.Concatenate(name=f'dense_{i}_concat')(dense_outputs)
-            x = layers.Dense(growth_rate, name=f'dense_layer_{i}')(concat_inputs)
-            x = layers.LeakyReLU(name=f'leaky_relu_layer_{i}')(x)
-            
-            dense_outputs.append(x)
-        x = layers.Concatenate(name='final_concat')(dense_outputs)
-        
-        x = layers.Dense(self.dense_width, activation='relu', name='transition_layer')(x)
-        
+        x = layers.Dense(self.dense_width, name='dense_1')(x)
+        x = layers.LeakyReLU(name='leaky_relu_1')(x)
+        x = layers.Dense(self.dense_width // 2, name='dense_2')(x)
+        x = layers.LeakyReLU(name='leaky_relu_2')(x)
+
         outputs = layers.Dense(1, name='output_layer')(x)
         
         lossfn = losses.Huber(delta=5.0)
         optimizer = optimizers.Adam(learning_rate=1e-3)
+        
         callbacks_list = [
-            callbacks.EarlyStopping(monitor='val_loss', patience=15,
+            callbacks.EarlyStopping(monitor='val_loss', patience=10,
                                   restore_best_weights=True),
             callbacks.ReduceLROnPlateau(monitor='val_loss', 
                                       factor=0.5, 
-                                      patience=7,
+                                      patience=5,
                                       min_lr=1e-6)
         ]
+        
         model = models.Model(inputs=inputs, outputs=outputs)
         model.compile(optimizer=optimizer,
                      loss=lossfn,
@@ -253,7 +210,7 @@ class TimeSeriesPredictor:
         
         model_data = model.fit(X_sequences, y, 
                              epochs=self.epochs,
-                             batch_size=32,
+                             batch_size=64,  # Increased batch size for speed
                              validation_split=0.1,
                              callbacks=callbacks_list,
                              verbose=1)
@@ -273,9 +230,10 @@ class TimeSeriesPredictor:
             X_sequences[i] = X[i:i + self.sequence_length]
         
         yhat = model.predict(X_sequences)
-        yhat = yhat.squeeze()
+        # Take the last prediction from each sequence
+        yhat = yhat[:, -1]  # Shape: (n_samples,)
         yhat_extended = np.zeros((yhat.shape[0], 4))
-        yhat_extended[:, 3] = yhat
+        yhat_extended[:, 3] = yhat.squeeze()
         price_pred = self.scalers['price'].inverse_transform(yhat_extended)[:, 3]
         return price_pred
 
@@ -329,7 +287,7 @@ class TimeSeriesPredictor:
             f"RNN: {self.rnn_width} | Dense: {self.dense_width}<br>" +
             f"Total: {model_data.model.count_params():,}<br><br>" +
             f"<b>Training:</b><br>" +
-            f"Batch: 32 | LR: 1e-5 | Seq: {self.sequence_length}"
+            f"Batch: 64 | LR: 1e-3 | Seq: {self.sequence_length}"
         )
         
         fig = make_subplots(rows=3, cols=1, 
@@ -444,7 +402,7 @@ class ModelTesting(TimeSeriesPredictor):
         prediction = self._test_predict(self.model, input_data)
         return input_data, prediction
 
-train = TimeSeriesPredictor(epochs=1, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
+train = TimeSeriesPredictor(epochs=5, rnn_width=256, dense_width=128, ticker='BTC-USD', chunks=1, interval='5m', age_days=0)
 data, yhat, model_data = train.run(save=True)
 train.create_plot(data, yhat, model_data, show_graph=True, save_image=True)
 
