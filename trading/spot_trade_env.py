@@ -8,6 +8,8 @@ from rich import print
 from tqdm import tqdm
 import plotly.graph_objects as go
 
+
+import scipy.stats as stats
 from time_series.close_predictor.close_only import ModelTesting
 
 @dataclass
@@ -93,6 +95,16 @@ class Portfolio:
         self.cash += proceeds
         
         if quantity == pos.quantity:
+            self.trade_history.append({
+            'symbol': symbol,
+            'action': 'SELL',
+            'quantity': quantity,
+            'price': price,
+            'proceeds': proceeds,
+            'cash_remaining': self.cash,
+            'timestamp': timestamp,
+            'PnL': self.positions[symbol].profit_loss
+            })
             del self.positions[symbol]
         else:
             self.positions[symbol] = Position(
@@ -101,16 +113,6 @@ class Portfolio:
                 average_price=pos.average_price,
                 current_price=price
             )
-            
-        self.trade_history.append({
-            'symbol': symbol,
-            'action': 'SELL',
-            'quantity': quantity,
-            'price': price,
-            'proceeds': proceeds,
-            'cash_remaining': self.cash,
-            'timestamp': timestamp
-        })
         if verbose:
             print(f"[red]Sold {quantity} shares of {symbol} at {price:.2f} for {proceeds:.2f}[/red]")
         return True
@@ -174,19 +176,28 @@ class TradingEnvironment:
         self.portfolio = Portfolio(initial_capital)
         self.data: Dict[str, pd.DataFrame] = {}
         self.current_index = 0
-        self.context_length = 100
+        self.context_length = 500
         self.context: Dict[str, pd.DataFrame] = {}  # Store context for each symbol
-        
+        self.extended_context = False
+
     def fetch_data(self):
         for symbol in self.symbols:
             data = pd.DataFrame()
+            times = []
             for x in range(self.chunks):
                 chunksize = 1
-                start_date = (datetime.now() - timedelta(days=chunksize) - timedelta(days=chunksize*x) - timedelta(days=self.age_days)).strftime('%Y-%m-%d')
-                end_date = (datetime.now() - timedelta(days=chunksize*x) - timedelta(days=self.age_days)).strftime('%Y-%m-%d')
-                temp_data = yf.download(symbol, start=start_date, end=end_date, interval=self.interval)
+                start_date = datetime.now() - timedelta(days=chunksize) - timedelta(days=chunksize*x) - timedelta(days=self.age_days)
+                end_date = datetime.now() - timedelta(days=chunksize*x) - timedelta(days=self.age_days)
+                temp_data = yf.download(symbol, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), interval=self.interval)
                 data = pd.concat([data, temp_data])
+                times.append(start_date)
+                times.append(end_date)
             
+            earliest = min(times)
+            latest = max(times)
+            difference = latest - earliest
+            print(f"{symbol} | {difference.days} days {difference.seconds//3600} hours {difference.seconds//60%60} minutes {difference.seconds%60} seconds")
+
             data.sort_index(inplace=True)
             data.columns = data.columns.droplevel(1)
             data.reset_index(inplace=True)
@@ -228,7 +239,7 @@ class TradingEnvironment:
         return self.data[self.symbols[0]].iloc[self.current_index]['Datetime']
     
     def step(self) -> bool:
-        extended_context = False
+        extended_context = self.extended_context
 
         if self.current_index >= len(self.data[self.symbols[0]]) - 1:
             return False
@@ -275,9 +286,9 @@ class TradingEnvironment:
 
     def get_summary(self) -> str:
         max_drawdown = max(self.portfolio.pct_pnl_history) - min(self.portfolio.pct_pnl_history)
-        gains = list(filter(lambda x: x > 0, self.portfolio.pnl_history))
-        losses = list(filter(lambda x: x < 0, self.portfolio.pnl_history))
-
+        closed_trades = list(filter(lambda x: x['action'] == 'SELL', self.portfolio.trade_history))
+        gains = list(filter(lambda x: x > 0, [trade['PnL'] for trade in closed_trades]))
+        losses = list(filter(lambda x: x < 0, [trade['PnL'] for trade in closed_trades]))
         if len(gains) == 0 or len(losses) == 0:
             profit_factor = np.nan
             RR_ratio = np.nan
@@ -288,8 +299,13 @@ class TradingEnvironment:
             RR_ratio = (sum(gains) / len(gains)) / abs(sum(losses) / len(losses))
             win_rate = len(gains) / (len(gains) + len(losses))
             optimal_wr = 1 / (RR_ratio + 1)
+
+        prices = np.array([self.portfolio.trade_history[i]['price'] for i in range(len(self.portfolio.trade_history))])
+        quantities = np.array([self.portfolio.trade_history[i]['quantity'] for i in range(len(self.portfolio.trade_history))])
+        total_volume = sum(prices * quantities)
+        total_trades = len(self.portfolio.trade_history)
         
-        return f"{self.symbols[0]} {self.interval} | PnL: {self.portfolio.total_profit_loss_pct:.2f}% | Max DD: {max_drawdown:.2f}% | PF: {profit_factor:.2f} | RR Ratio:{RR_ratio:.2f} | WR: {win_rate:.2f} | Optimal WR: {optimal_wr:.2f}"
+        return f"{self.symbols[0]} {self.interval} | PnL: {self.portfolio.total_profit_loss_pct:.2f}% | Max DD: {max_drawdown:.2f}% | PF: {profit_factor:.2f} | RR Ratio:{RR_ratio:.2f} | WR: {win_rate:.2f} | Optimal WR: {optimal_wr:.2f} | Total Volume: {total_volume:.2f} | Total Trades: {total_trades} | Gains: {len(gains)} | Losses: {len(losses)}"
 
     def create_performance_plot(self, show_graph: bool = False):
         fig = go.Figure()
@@ -329,6 +345,7 @@ class TradingEnvironment:
 class Backtest:
     def __init__(self, env: TradingEnvironment):
         self.env = env
+        self.current_symbol = env.symbols[0]
 
     def _calculate_rsi(self, context, period=14):
         delta_p = context['Close'].diff()
@@ -351,17 +368,65 @@ class Backtest:
         histogram = macd_line - signal_line
 
         return macd_line, signal_line, histogram
+
+    def _calculate_atr(self, context, period=14):
+        high = context['High']
+        low = context['Low']
+        close = context['Close']
+
+        tr1 = high - low
+        tr2 = abs(high - close.shift(1))
+        tr3 = abs(low - close.shift(1))
+
+        tr = pd.Series([max(a, b, c) for a, b, c in zip(tr1, tr2, tr3)])
+
+        atr = tr.rolling(window=period).mean()
+        return atr
+    def _calculate_supertrend(self, context, period=14):
+        atr = self._calculate_atr(context, period=period)
+        multiplier = 3.0
         
+        hl2 = (context['High'] + context['Low']) / 2
+        basic_upperband = hl2 + (multiplier * atr)
+        basic_lowerband = hl2 - (multiplier * atr)
+        
+        final_upperband = basic_upperband.copy()
+        final_lowerband = basic_lowerband.copy()
+        supertrend = pd.Series(index=context.index, dtype=float)
+        
+        supertrend.iloc[0] = final_upperband.iloc[0]
+        
+        close = context['Close']
+        prev_upperband = final_upperband.shift(1)
+        prev_lowerband = final_lowerband.shift(1)
+        prev_supertrend = supertrend.shift(1)
+        
+        mask_upper = (basic_upperband < prev_upperband) | (close.shift(1) > prev_upperband)
+        final_upperband.loc[mask_upper] = basic_upperband.loc[mask_upper]
+        final_upperband.loc[~mask_upper] = prev_upperband.loc[~mask_upper]
+        
+        mask_lower = (basic_lowerband > prev_lowerband) | (close.shift(1) < prev_lowerband)
+        final_lowerband.loc[mask_lower] = basic_lowerband.loc[mask_lower]
+        final_lowerband.loc[~mask_lower] = prev_lowerband.loc[~mask_lower]
+        
+        mask_supertrend = close > final_upperband
+        supertrend.loc[mask_supertrend] = final_lowerband.loc[mask_supertrend]
+        supertrend.loc[~mask_supertrend] = final_upperband.loc[~mask_supertrend]
+        return supertrend
+    
+    def _calculate_std(self, context, period=20):
+        return context['Close'].rolling(window=period).std()
+
     def MA(self, env: TradingEnvironment, context, current_ohlcv):
         ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
-        ma100 = context['Close'].rolling(window=200).mean().iloc[-1]
+        ma200 = context['Close'].rolling(window=200).mean().iloc[-1]
 
         current_close = current_ohlcv['Close']
 
-        if current_close > ma50 and current_close > ma100:
-            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
-        elif current_close < ma50 and current_close < ma100:
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+        if ma50 < ma200:
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
+        elif ma50 > ma200:
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
 
     def RSI(self, env: TradingEnvironment, context, current_ohlcv):
         current_close = current_ohlcv['Close']
@@ -370,10 +435,9 @@ class Backtest:
         current_rsi = rsi.iloc[-1]
 
         if current_rsi < 30:
-            env.portfolio.buy('BTC-USD',0.1, current_close, env.get_current_timestamp())
+            env.portfolio.buy(self.current_symbol, 0.1, current_close, env.get_current_timestamp())
         elif current_rsi > 70:
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
-
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
 
     def MACD(self, env: TradingEnvironment, context, current_ohlcv):
         current_close = current_ohlcv['Close']
@@ -383,45 +447,68 @@ class Backtest:
         current_signal_line = signal_line.iloc[-1]
         current_histogram = histogram.iloc[-1]
         if current_macd_line > current_signal_line and current_histogram > 30:
-            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
         elif current_macd_line < current_signal_line and current_histogram < -30:
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
+
+    def CDF(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+        mu, sigma = stats.norm.fit(context['Close'])
+        x = np.linspace(mu - 3*sigma, mu + 3*sigma, 1000)
+        pdf = stats.norm.pdf(x, mu, sigma)
+        cdf = stats.norm.cdf(x, mu, sigma)
         
+        current_cdf = stats.norm.cdf(current_close, mu, sigma)
+
+        if current_cdf < 0.3:
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
+        elif current_cdf > 0.7:
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
+
     def Custom(self, env: TradingEnvironment, context, current_ohlcv):
         current_close = current_ohlcv['Close']
 
-        rsi = self._calculate_rsi(context, 28)
-        current_rsi = rsi.iloc[-1]
-        macd_line, signal_line, histogram = self._calculate_macd(context)
-        current_macd_line = macd_line.iloc[-1]
-        current_signal_line = signal_line.iloc[-1]
-        current_histogram = histogram.iloc[-1]
+        std = self._calculate_std(context, 20)
+        current_std = std.iloc[-1]
 
-        buy_conditions = [current_close > context['Close'].iloc[-2], current_macd_line > current_signal_line]
-        sell_conditions = [current_close < context['Close'].iloc[-2], current_macd_line < current_signal_line]
+        buy_conditions = [current_close > context['Close'].iloc[-2], current_std < 100]
+        sell_conditions = [current_close < context['Close'].iloc[-2], current_std > 100]
 
         if all(buy_conditions):
-            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
         elif all(sell_conditions):
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
+        
+    def SuperTrend(self, env: TradingEnvironment, context, current_ohlcv):
+        current_close = current_ohlcv['Close']
+        supertrend = self._calculate_supertrend(context)
+        current_supertrend = supertrend.iloc[-1]
+        prev_close = context['Close'].iloc[-2]
+        prev_supertrend = supertrend.iloc[-2]
+        
+        if current_close > current_supertrend and prev_close <= prev_supertrend:
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
+
+        elif current_close < current_supertrend and prev_close >= prev_supertrend:
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
 
     def RNN(self, env: TradingEnvironment, context, current_ohlcv, model):
         input_data, prediction = model.run(context)
         current_close = current_ohlcv['Close']
 
         if prediction > current_close:
-            env.portfolio.buy_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
         else:
-            env.portfolio.sell_max('BTC-USD', current_close, env.get_current_timestamp())
+            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
     
     def Perfect(self, env, context, current_ohlcv):
         #perfect strategy
         index = env.current_index
         try:
             if context['Close'].iloc[-1] < env.data[env.symbols[0]]['Close'].iloc[index+1]:
-                env.portfolio.buy_max('BTC-USD', current_ohlcv['Close'], env.get_current_timestamp())
+                env.portfolio.buy_max(self.current_symbol, current_ohlcv['Close'], env.get_current_timestamp())
             elif context['Close'].iloc[-1] > env.data[env.symbols[0]]['Close'].iloc[index+1]:
-                env.portfolio.sell_max('BTC-USD', current_ohlcv['Close'], env.get_current_timestamp())
+                env.portfolio.sell_max(self.current_symbol, current_ohlcv['Close'], env.get_current_timestamp())
             print(env.portfolio.total_profit_loss_pct)
         except:
             pass
@@ -439,10 +526,10 @@ class Backtest:
 
         while env.step():
             current_state = env.get_state()
-            context = current_state['context'][env.symbols[0]] #context includes current price
-            current_ohlcv = current_state['prices'][env.symbols[0]] #current ohlcv
+            context = current_state['context'][self.current_symbol] #context includes current price
+            current_ohlcv = current_state['prices'][self.current_symbol] #current ohlcv
 
-            self.MACD(env, context, current_ohlcv)
+            self.SuperTrend(env, context, current_ohlcv)
             progress_bar.update(1)
         progress_bar.close()
 
@@ -450,6 +537,6 @@ class Backtest:
 
         env.create_performance_plot(show_graph=True)
 
-env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=100000, chunks=29, interval='5m', age_days=10)
+env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=1000, chunks=29, interval='1m', age_days=0)
 backtest = Backtest(env)
 backtest.run()
