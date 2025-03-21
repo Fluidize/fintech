@@ -176,7 +176,7 @@ class TradingEnvironment:
         self.portfolio = Portfolio(initial_capital)
         self.data: Dict[str, pd.DataFrame] = {}
         self.current_index = 0
-        self.context_length = 500
+        self.context_length = 200
         self.context: Dict[str, pd.DataFrame] = {}  # Store context for each symbol
         self.extended_context = False
 
@@ -460,7 +460,7 @@ class Backtest:
         
         current_cdf = stats.norm.cdf(current_close, mu, sigma)
 
-        if current_cdf < 0.3:
+        if current_cdf < 0.2:
             env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
         elif current_cdf > 0.7:
             env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
@@ -471,8 +471,8 @@ class Backtest:
         std = self._calculate_std(context, 20)
         current_std = std.iloc[-1]
 
-        buy_conditions = [current_close > context['Close'].iloc[-2], current_std < 100]
-        sell_conditions = [current_close < context['Close'].iloc[-2], current_std > 100]
+        buy_conditions = [current_close > context['Close'].iloc[-2], current_std < 75] #if std threshold is same on each side, PnL is better
+        sell_conditions = [current_close < context['Close'].iloc[-2], current_std > 75]
 
         if all(buy_conditions):
             env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
@@ -529,7 +529,7 @@ class Backtest:
             context = current_state['context'][self.current_symbol] #context includes current price
             current_ohlcv = current_state['prices'][self.current_symbol] #current ohlcv
 
-            self.SuperTrend(env, context, current_ohlcv)
+            self.Custom(env, context, current_ohlcv)
             progress_bar.update(1)
         progress_bar.close()
 
