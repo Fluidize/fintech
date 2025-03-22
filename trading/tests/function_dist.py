@@ -47,8 +47,11 @@ def _calculate_macd(context, fast_period=12, slow_period=26, signal_period=9):
 data = fetch_data('BTC-USD', 29, '5m', 10)
 
 # Calculate returns instead of standard deviation
-returns = data['Close'].pct_change().dropna()
-mu, sigma = norm.fit(returns)
+raw_std = data['Close'].rolling(window=20).std()
+std = raw_std/raw_std.max()
+
+
+mu, sigma = norm.fit(std.dropna())
 print(f"Mean return: {mu:.4f}, Std of returns: {sigma:.4f}")
 
 x = np.linspace(mu - 3*sigma, mu + 3*sigma, 1000)
@@ -56,18 +59,9 @@ pdf = norm.pdf(x, mu, sigma)
 cdf = norm.cdf(x, mu, sigma)
 
 fig = sp.make_subplots(rows=2, cols=1, 
-                      subplot_titles=('Distribution of Returns', 'Cumulative Distribution of Returns'))
-fig.add_trace(go.Scatter(x=x, y=pdf, mode='lines', name='Normal Distribution'), row=1, col=1)
-fig.add_trace(go.Scatter(x=x, y=cdf, mode='lines', name='Cumulative Distribution'), row=2, col=1)
-
-# Add histogram of actual returns
-fig.add_trace(go.Histogram(x=returns, name='Actual Returns', nbinsx=50, opacity=0.5), row=1, col=1)
-
-fig.update_layout(title_text='BTC-USD Returns Distribution Analysis')
-fig.update_xaxes(title_text='Return', row=1, col=1)
-fig.update_xaxes(title_text='Return', row=2, col=1)
-fig.update_yaxes(title_text='Probability Density', row=1, col=1)
-fig.update_yaxes(title_text='Cumulative Probability', row=2, col=1)
+                      subplot_titles=('PDF', 'CDF'))
+fig.add_trace(go.Scatter(x=x, y=pdf, mode='lines', name='PDF'), row=1, col=1)
+fig.add_trace(go.Scatter(x=x, y=cdf, mode='lines', name='CDF'), row=2, col=1)
 
 fig.show()
 

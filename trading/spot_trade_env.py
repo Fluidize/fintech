@@ -168,7 +168,8 @@ class Portfolio:
         return self.sell(symbol, quantity, price, timestamp, verbose)
 
 class TradingEnvironment:
-    def __init__(self, symbols: List[str], initial_capital: float = 10000.0, chunks: int = 5, interval: str = '5m', age_days: int = 10):
+    def __init__(self,  symbols: List[str], instance_name: str = 'default', initial_capital: float = 10000.0, chunks: int = 5, interval: str = '5m', age_days: int = 10):
+        self.instance_name = instance_name
         self.symbols = symbols
         self.chunks = chunks
         self.interval = interval
@@ -343,9 +344,16 @@ class TradingEnvironment:
         return fig
 
 class Backtest:
-    def __init__(self, env: TradingEnvironment):
-        self.env = env
-        self.current_symbol = env.symbols[0]
+    def __init__(self):
+        self.environments = {
+                "Custom": TradingEnvironment(symbols=['SOL-USD'],instance_name='Custom', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                "MA": TradingEnvironment(symbols=['SOL-USD'],instance_name='MA', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                "RSI": TradingEnvironment(symbols=['SOL-USD'],instance_name='RSI', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                "MACD": TradingEnvironment(symbols=['SOL-USD'],instance_name='MACD', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                "CDF": TradingEnvironment(symbols=['SOL-USD'],instance_name='CDF', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                "SuperTrend": TradingEnvironment(symbols=['SOL-USD'],instance_name='SuperTrend', initial_capital=1000, chunks=29, interval='1m', age_days=0),
+                             }
+        self.current_symbol = self.environments["Custom"].symbols[0]
 
     def _calculate_rsi(self, context, period=14):
         delta_p = context['Close'].diff()
@@ -382,6 +390,7 @@ class Backtest:
 
         atr = tr.rolling(window=period).mean()
         return atr
+    
     def _calculate_supertrend(self, context, period=14):
         atr = self._calculate_atr(context, period=period)
         multiplier = 3.0
@@ -415,7 +424,9 @@ class Backtest:
         return supertrend
     
     def _calculate_std(self, context, period=20):
-        return context['Close'].rolling(window=period).std()
+        raw_std = context['Close'].rolling(window=period).std()
+        std = raw_std/raw_std.max() #normalize std or else different symbols will have different thresholds
+        return std
 
     def MA(self, env: TradingEnvironment, context, current_ohlcv):
         ma50 = context['Close'].rolling(window=50).mean().iloc[-1]
@@ -470,15 +481,22 @@ class Backtest:
 
         std = self._calculate_std(context, 20)
         current_std = std.iloc[-1]
-
-        buy_conditions = [current_close > context['Close'].iloc[-2], current_std < 75] #if std threshold is same on each side, PnL is better
-        sell_conditions = [current_close < context['Close'].iloc[-2], current_std > 75]
+        prev_close = context['Close'].iloc[-2]
+        
+        # Calculate price change percentage
+        price_change_pct = ((current_close - prev_close) / prev_close) * 100
+        
+        # Adjust std threshold based on symbol
+        std_threshold = 0.3
+        
+        buy_conditions = [current_close > prev_close, current_std < std_threshold]
+        sell_conditions = [current_close < prev_close, current_std > std_threshold]
 
         if all(buy_conditions):
-            env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
+            success = env.portfolio.buy_max(self.current_symbol, current_close, env.get_current_timestamp())
         elif all(sell_conditions):
-            env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
-        
+            success = env.portfolio.sell_max(self.current_symbol, current_close, env.get_current_timestamp())
+
     def SuperTrend(self, env: TradingEnvironment, context, current_ohlcv):
         current_close = current_ohlcv['Close']
         supertrend = self._calculate_supertrend(context)
@@ -515,28 +533,28 @@ class Backtest:
     
 
     def run(self, strategy=None):
-        env = self.env
-
-        env.fetch_data()
+        for env in self.environments.values():
+            env.fetch_data()
         print("Starting Backtest")
-        progress_bar = tqdm(total=len(env.data[env.symbols[0]]))
 
-        # model = ModelTesting(ticker=None, chunks=None, interval=None, age_days=None)
-        # model.load_model(r'BTC-USD_5m_11476066.keras')
+        self.strategies = [self.Custom, self.MA, self.RSI, self.MACD, self.CDF, self.SuperTrend]
 
-        while env.step():
-            current_state = env.get_state()
-            context = current_state['context'][self.current_symbol] #context includes current price
-            current_ohlcv = current_state['prices'][self.current_symbol] #current ohlcv
+        for env, strategy in zip(self.environments.values(), self.strategies):
+            progress_bar = tqdm(total=len(env.data[env.symbols[0]]))
+            while env.step():
+                current_state = env.get_state()
+                context = current_state['context'][self.current_symbol]
+                current_ohlcv = current_state['prices'][self.current_symbol]
+                strategy(env, context, current_ohlcv)
+                progress_bar.update(1)
+            progress_bar.close()
 
-            self.Custom(env, context, current_ohlcv)
-            progress_bar.update(1)
-        progress_bar.close()
+            print("\nFinal Portfolio State:")
+            print(f"Cash: {env.portfolio.cash:.2f}")
+            print(f"Total Value: {env.portfolio.total_value:.2f}")
+            print(env.get_summary())
 
-        print(env.get_summary())
+            env.create_performance_plot(show_graph=True)
 
-        env.create_performance_plot(show_graph=True)
-
-env = TradingEnvironment(symbols=['BTC-USD'], initial_capital=1000, chunks=29, interval='1m', age_days=0)
-backtest = Backtest(env)
+backtest = Backtest()
 backtest.run()
